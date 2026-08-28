@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "golden_finger": {
+      "title": "Codex金手指",
+      "description": "Golden Finger for Codex: connect Codex to the separately launched human-authorization relay window for the Yes工程师 workflow.",
+      "command": "python",
+      "args": [
+        "-u",
+        "./scripts/relay_mcp_server.py"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "LOCALAPPDATA",
+        "PATH",
+        "USERPROFILE"
+      ],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 65,
+      "default_tools_approval_mode": "auto"
+    }
+  }
+}

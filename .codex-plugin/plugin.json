@@ -1,0 +1,29 @@
+{
+  "name": "golden-finger",
+  "version": "0.1.9",
+  "description": "Golden Finger for Codex — a local human-authorization relay for one-time consent and exact command execution, made for the Yes工程师 workflow.",
+  "author": {
+    "name": "Golden Finger for Codex Project"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex\u91d1\u624b\u6307",
+    "shortDescription": "\u4eba\u673a\u6388\u6743\u4e2d\u7ee7\uff1aYes\u5de5\u7a0b\u5e08\u7684\u4e00\u952e\u786e\u8ba4\u4e0e\u547d\u4ee4\u6388\u6743\u7a97\u53e3",
+    "longDescription": "Codex\u91d1\u624b\u6307\uff08Golden Finger for Codex\uff09\u662f\u4e3a Yes\u5de5\u7a0b\u5e08\u51c6\u5907\u7684\u4eba\u673a\u6388\u6743\u4e2d\u7ee7\u3002\u5b83\u628a Codex \u63d0\u8bae\u7684\u5355\u6b21\u547d\u4ee4\u6216\u81ea\u7136\u8bed\u8a00\u6388\u6743\u8bf7\u6c42\u9001\u5230\u72ec\u7acb\u7a97\u53e3\uff0c\u51bb\u7ed3\u5e76\u5c55\u793a\u5b8c\u8bf7\u6c42\uff1b\u53ea\u6709\u7528\u6237\u70b9\u51fb\u201c\u540c\u610f\u672c\u6b21\u201d\u540e\u624d\u8fd4\u56de\u540c\u610f\u6216\u6267\u884c\u7cbe\u786e\u547d\u4ee4\uff0c\u5e76\u7531\u5f53\u524d Codex \u56de\u5408\u6301\u7eed\u62c9\u53d6\u5230\u7ec8\u6001\u3002",
+    "developerName": "Golden Finger for Codex Project",
+    "category": "Productivity",
+    "capabilities": [
+      "One-time human authorization",
+      "Local command execution after approval",
+      "User-invoked no-console window launcher",
+      "Non-click-through Codex-themed 60% acrylic window with fully opaque text",
+      "Latest-request foreground and optional sound alerts",
+      "Responsive minimum-size layout with a fixed approval bar",
+      "Compact live polling policy with an automatically derived total timeout"
+    ],
+    "defaultPrompt": [
+      "\u4f7f\u7528 Codex\u91d1\u624b\u6307\uff08\u4eba\u673a\u6388\u6743\u4e2d\u7ee7\uff09\uff0c\u4e3a\u5f53\u524d\u552f\u4e00\u52a8\u4f5c\u8bf7\u6c42\u4e00\u6b21\u660e\u786e\u7684\u4eba\u7c7b\u786e\u8ba4\uff1b\u82e5\u4ecd\u4e3a pending/running\uff0c\u4fdd\u6301\u5f53\u524d\u56de\u5408\u5e76\u4e25\u683c\u6309\u7167\u54cd\u5e94\u4e2d\u7684\u4e0b\u4e00\u6b21\u53c2\u6570\u8f6e\u8be2\u5230\u7ec8\u6001\u3002"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
