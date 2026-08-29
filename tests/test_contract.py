@@ -1,16 +1,20 @@
 """External-only unit tests for Golden Finger for Codex.
 
-Run these from a user-controlled terminal. They do not launch Codex, the GUI,
-or an actual command process.
+Run these from a user-controlled terminal. They do not launch Codex or the GUI.
+On Windows one bounded Python child verifies Job Object termination.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -18,28 +22,182 @@ sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 
 from relay_broker import (
     RequestStore,
+    RelayRequestHandler,
+    RelayTCPServer,
+    WindowsJob,
     WINDOW_HIT_SHIELD_OPACITY,
     WINDOW_MIN_HEIGHT,
     WINDOW_MIN_WIDTH,
     acrylic_gradient_color,
+    collect_install_diagnostics,
     execution_mode_label,
+    format_install_diagnostics,
     load_ui_settings,
     normalize_poll_policy,
     read_codex_theme_preference,
     resolve_theme,
     safe_transparent_client,
     save_ui_settings,
+    write_broker_self_test,
 )
+from codex_lifecycle import (
+    APP_TOOLS_SCHEMA_VERSION,
+    CodexLifecycleError,
+    CodexTaskInventory,
+    CodexTaskMonitor,
+    extract_codex_thread_id,
+    is_codex_desktop_executable,
+    parse_list_threads_payload,
+)
+import relay_mcp_server
 from relay_mcp_server import TOOLS, _polling_directive, handle_request
 from relay_protocol import (
+    CLAIM_TOKEN_PREFIX,
+    canonical_hash,
     DEFAULT_APPROVAL_EXPIRY_SECONDS,
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_PENDING_POLL_CYCLES,
     DEFAULT_POLL_WAIT_SECONDS,
     MAX_COMMAND_TIMEOUT_SECONDS,
+    PACKAGE_VERSION,
+    PROTOCOL_VERSION,
+    RUNTIME_BUILD_ID,
     RelayError,
+    RelayClient,
+    read_endpoint,
+    new_client_instance_id,
     normalize_request,
+    verify_script_dependencies,
 )
+
+
+CLIENT_A = "gfi_" + "A" * 32
+CLIENT_B = "gfi_" + "B" * 32
+TEST_CLAIM = CLAIM_TOKEN_PREFIX + "T" * 43
+THREAD_A = "01a0382e-9681-7082-b7a6-62884a6da9da"
+THREAD_B = "01a03f18-7fc6-7172-9b0d-8d898f903224"
+
+
+class LifecycleTests(unittest.TestCase):
+    @staticmethod
+    def inventory_payload() -> dict[str, object]:
+        return {
+            "schemaVersion": APP_TOOLS_SCHEMA_VERSION,
+            "pinnedThreads": [
+                {
+                    "id": THREAD_A,
+                    "title": "  当前\x00任务\u202e  ",
+                    "status": "active",
+                    "cwd": r"C:\finger",
+                    "kind": "codex",
+                    "updatedAt": 10,
+                }
+            ],
+            "threads": [
+                {
+                    "id": THREAD_B,
+                    "title": "Idle task",
+                    "status": "idle",
+                    "cwd": r"C:\bridge",
+                    "kind": "codex",
+                    "updatedAt": 20,
+                }
+            ],
+            "unavailableHosts": [],
+            "unavailableSources": [],
+        }
+
+    def test_thread_metadata_extraction_is_bounded_to_host_ids(self) -> None:
+        self.assertEqual(
+            extract_codex_thread_id({"openai/threadId": THREAD_A.upper()}),
+            THREAD_A,
+        )
+        self.assertEqual(
+            extract_codex_thread_id(
+                {"x-codex-turn-metadata": '{"thread_id":"' + THREAD_B + '"}'}
+            ),
+            THREAD_B,
+        )
+        self.assertIsNone(extract_codex_thread_id({"threadId": "../../fake"}))
+
+    def test_inventory_includes_pinned_tasks_and_sanitizes_display_text(self) -> None:
+        tasks = parse_list_threads_payload(self.inventory_payload())
+        self.assertEqual([task.task_id for task in tasks], [THREAD_A, THREAD_B])
+        self.assertEqual(tasks[0].title, "当前 任务")
+        self.assertTrue(tasks[0].active)
+
+    def test_inventory_contract_fails_closed_on_drift_or_partial_sources(self) -> None:
+        wrong_schema = self.inventory_payload()
+        wrong_schema["schemaVersion"] = APP_TOOLS_SCHEMA_VERSION + 1
+        with self.assertRaises(CodexLifecycleError) as raised:
+            parse_list_threads_payload(wrong_schema)
+        self.assertEqual(raised.exception.code, "inventory_schema_mismatch")
+
+        partial = self.inventory_payload()
+        partial["unavailableSources"] = ["remote"]
+        with self.assertRaises(CodexLifecycleError) as raised:
+            parse_list_threads_payload(partial)
+        self.assertEqual(raised.exception.code, "inventory_partial")
+
+        unsupported = self.inventory_payload()
+        unsupported["threads"][0]["status"] = "newFutureState"  # type: ignore[index]
+        with self.assertRaises(CodexLifecycleError) as raised:
+            parse_list_threads_payload(unsupported)
+        self.assertEqual(raised.exception.code, "inventory_status_unsupported")
+
+        truncated = self.inventory_payload()
+        truncated["pinnedThreads"] = []
+        truncated["threads"] = [
+            {
+                "id": f"00000000-0000-0000-0000-{index:012x}",
+                "title": f"Task {index}",
+                "status": "idle",
+                "cwd": r"C:\finger",
+                "kind": "codex",
+                "updatedAt": index,
+            }
+            for index in range(50)
+        ]
+        with self.assertRaises(CodexLifecycleError) as raised:
+            parse_list_threads_payload(truncated)
+        self.assertEqual(raised.exception.code, "inventory_truncated")
+
+    def test_inventory_freshness_expires_before_restart_can_use_it(self) -> None:
+        stale = CodexTaskInventory(
+            available=True,
+            tasks=(),
+            checked_monotonic=time.monotonic() - 60,
+            source_count=1,
+        )
+        self.assertFalse(stale.is_fresh())
+
+    def test_inventory_monitor_uses_only_registered_thread_ids(self) -> None:
+        observed: list[tuple[str, ...]] = []
+
+        def fake_probe(values: object) -> CodexTaskInventory:
+            normalized = tuple(values)  # type: ignore[arg-type]
+            observed.append(normalized)
+            return CodexTaskInventory(
+                available=True,
+                tasks=(),
+                checked_monotonic=time.monotonic(),
+                source_count=1,
+            )
+
+        monitor = CodexTaskMonitor(probe=fake_probe)
+        monitor.register_thread_ids(["invalid", THREAD_A, THREAD_A])
+        snapshot = monitor.probe_now()
+        self.assertTrue(snapshot.is_fresh())
+        self.assertEqual(observed, [(THREAD_A,)])
+
+    def test_codex_desktop_executable_allowlist_is_exact(self) -> None:
+        self.assertTrue(
+            is_codex_desktop_executable(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_1.2.3_x64__test\app\ChatGPT.exe"
+            )
+        )
+        self.assertFalse(is_codex_desktop_executable(r"C:\Temp\ChatGPT.exe"))
+        self.assertFalse(is_codex_desktop_executable(r"C:\Windows\System32\cmd.exe"))
 
 
 class ProtocolTests(unittest.TestCase):
@@ -59,6 +217,23 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(frozen["request_hash"]), 64)
         self.assertEqual(frozen["approved_reply"], "同意")
         self.assertEqual(frozen["expires_in_seconds"], 3_600)
+
+    def test_source_labels_are_frozen_but_explicitly_human_readable(self) -> None:
+        frozen = normalize_request(
+            "consent",
+            {
+                "exact_action": "Authorize one test step.",
+                "target": "one test target",
+                "risk": "No external side effect.",
+                "recovery": "No recovery is needed.",
+                "idempotency_key": "test-source-labels-0001",
+                "source_label": "C:\\finger validation",
+                "source_project": "C:\\finger",
+                "source_task": "Golden Finger contract tests",
+            },
+        )
+        self.assertEqual(frozen["source_project"], "C:\\finger")
+        self.assertEqual(frozen["source_task"], "Golden Finger contract tests")
 
     def test_command_defaults_to_one_hour_and_rejects_above_hard_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -102,6 +277,21 @@ class ProtocolTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "invalid_request")
 
+    def test_routing_scope_is_not_part_of_the_frozen_request(self) -> None:
+        with self.assertRaises(RelayError) as raised:
+            normalize_request(
+                "consent",
+                {
+                    "exact_action": "Keep routing preference outside the request.",
+                    "target": "one authorization card",
+                    "risk": "Scope must not become standing consent.",
+                    "recovery": "Remove scope from the proposal.",
+                    "idempotency_key": "test-scope-not-protocol-0001",
+                    "scope": "project",
+                },
+            )
+        self.assertEqual(raised.exception.code, "invalid_request")
+
     def test_command_resolves_interpreter_and_rejects_codex_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             frozen = normalize_request(
@@ -136,11 +326,118 @@ class ProtocolTests(unittest.TestCase):
                 )
             self.assertEqual(raised.exception.code, "protected_target")
 
+    def test_direct_script_bytes_are_frozen_and_reverified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            script = Path(temporary_directory) / "approved.py"
+            script.write_text("print('approved')\n", encoding="utf-8")
+            frozen = normalize_request(
+                "command",
+                {
+                    "exact_action": "Run one direct Python script.",
+                    "target": str(script),
+                    "risk": "The script is not executed by this unit test.",
+                    "recovery": "Delete the temporary directory.",
+                    "idempotency_key": "test-script-freeze-0001",
+                    "executable": sys.executable,
+                    "arguments": [str(script)],
+                    "working_directory": temporary_directory,
+                },
+            )
+            dependencies = frozen["script_dependencies"]
+            self.assertEqual(len(dependencies), 1)
+            self.assertEqual(dependencies[0]["path"], str(script.resolve()))
+            self.assertEqual(verify_script_dependencies(dependencies), [])
+            script.write_text("print('changed')\n", encoding="utf-8")
+            mismatches = verify_script_dependencies(dependencies)
+            self.assertEqual(len(mismatches), 1)
+            self.assertNotEqual(
+                mismatches[0]["expected_sha256"],
+                mismatches[0]["observed_sha256"],
+            )
+
+    def test_inline_python_has_no_script_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            frozen = normalize_request(
+                "command",
+                {
+                    "exact_action": "Keep one inline command visible.",
+                    "target": "test stdout",
+                    "risk": "The command is not executed by this unit test.",
+                    "recovery": "No recovery is needed.",
+                    "idempotency_key": "test-script-freeze-0002",
+                    "executable": sys.executable,
+                    "arguments": ["-c", "print('inline')"],
+                    "working_directory": temporary_directory,
+                },
+            )
+            self.assertEqual(frozen["script_dependencies"], [])
+
+    def test_endpoint_requires_exact_component_version_and_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            endpoint = Path(temporary_directory) / "endpoint.json"
+            metadata = {
+                "protocol": PROTOCOL_VERSION,
+                "broker_version": PACKAGE_VERSION,
+                "broker_build_id": "wrong-build",
+                "host": "127.0.0.1",
+                "port": 12345,
+                "token": "T" * 32,
+                "pid": 123,
+                "started_at": "2026-08-29T00:00:00Z",
+            }
+            endpoint.write_text(__import__("json").dumps(metadata), encoding="ascii")
+            with patch("relay_protocol.endpoint_path", return_value=endpoint):
+                with self.assertRaises(RelayError) as raised:
+                    read_endpoint()
+            self.assertEqual(raised.exception.code, "component_mismatch")
+            metadata["broker_build_id"] = RUNTIME_BUILD_ID
+            endpoint.write_text(__import__("json").dumps(metadata), encoding="ascii")
+            with patch("relay_protocol.endpoint_path", return_value=endpoint):
+                self.assertEqual(read_endpoint()["broker_version"], PACKAGE_VERSION)
+
 
 class StoreTests(unittest.TestCase):
+    def test_wire_handshake_rejects_a_same_version_different_build(self) -> None:
+        store = RequestStore(elevated=False)
+        server = RelayTCPServer(
+            ("127.0.0.1", 0),
+            RelayRequestHandler,
+            token="wire-test-token-" + "T" * 24,
+            store=store,
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        client = RelayClient(
+            {
+                "host": "127.0.0.1",
+                "port": server.server_address[1],
+                "token": server.token,
+            }
+        )
+        try:
+            with self.assertRaises(RelayError) as raised:
+                client.call(
+                    "health",
+                    client_build_id="same-version-wrong-build",
+                    client_instance_id=CLIENT_A,
+                )
+            self.assertEqual(raised.exception.code, "component_mismatch")
+            self.assertIsNone(server.connector_snapshot())
+            health = client.call("health", client_instance_id=CLIENT_A)
+            self.assertEqual(health["broker_build_id"], RUNTIME_BUILD_ID)
+            self.assertEqual(
+                server.connector_snapshot()["connector_fingerprint"],
+                canonical_hash(CLIENT_A)[:12],
+            )
+        finally:
+            store.shutdown()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+
     def test_gui_consent_decision_is_one_shot(self) -> None:
         store = RequestStore(elevated=False)
-        submitted, replay = store.submit(
+        submitted, replay, claim_token = store.submit(
             "consent",
             {
                 "exact_action": "Continue one bounded test.",
@@ -150,13 +447,59 @@ class StoreTests(unittest.TestCase):
                 "idempotency_key": "test-store-0001",
                 "approved_reply": "授权",
             },
+            CLIENT_A,
         )
         self.assertFalse(replay)
+        self.assertTrue(claim_token.startswith(CLAIM_TOKEN_PREFIX))
+        self.assertNotIn("claim_token", submitted)
+        self.assertNotIn("client_instance_id", submitted)
+        self.assertEqual(len(submitted["claim_fingerprint"]), 12)
         approved = store.approve_from_gui(submitted["request_id"])
         self.assertEqual(approved["state"], "approved")
         self.assertEqual(approved["result"]["reply_text"], "授权")
         with self.assertRaises(RelayError):
             store.approve_from_gui(submitted["request_id"])
+
+    def test_restart_gate_is_atomic_and_thread_binding_stays_weak(self) -> None:
+        store = RequestStore(elevated=False)
+        submitted, _replay, _claim_token = store.submit(
+            "consent",
+            {
+                "exact_action": "Approve one correlated request.",
+                "target": "test state",
+                "risk": "No external effect.",
+                "recovery": "Reject the request.",
+                "idempotency_key": "test-restart-gate-0001",
+            },
+            CLIENT_A,
+            THREAD_A,
+        )
+        row = store.rows_for_gui()[0]
+        self.assertEqual(row["codex_thread_id"], THREAD_A)
+        self.assertNotIn("codex_thread_id", submitted)
+        acquired, reason = store.try_begin_codex_restart()
+        self.assertFalse(acquired)
+        self.assertEqual(reason, "relay_requests_active")
+
+        store.reject_from_gui(submitted["request_id"])
+        acquired, reason = store.try_begin_codex_restart()
+        self.assertTrue(acquired)
+        self.assertEqual(reason, "restart_gate_acquired")
+        with self.assertRaises(RelayError) as raised:
+            store.submit(
+                "consent",
+                {
+                    "exact_action": "Do not enter while the restart gate is held.",
+                    "target": "test state",
+                    "risk": "No external effect.",
+                    "recovery": "Release the gate.",
+                    "idempotency_key": "test-restart-gate-0002",
+                },
+                CLIENT_A,
+            )
+        self.assertEqual(raised.exception.code, "broker_restarting_codex")
+        store.end_codex_restart()
+        self.assertFalse(store.restart_is_pending())
 
     def test_idempotency_conflict_fails_closed(self) -> None:
         store = RequestStore(elevated=False)
@@ -167,7 +510,7 @@ class StoreTests(unittest.TestCase):
             "recovery": "Recovery",
             "idempotency_key": "test-store-0002",
         }
-        store.submit("consent", base)
+        _submitted, _replay, first_claim = store.submit("consent", base, CLIENT_A)
         store.update_poll_policy(
             {
                 "sound_enabled": True,
@@ -176,14 +519,84 @@ class StoreTests(unittest.TestCase):
                 "command_timeout_seconds": 600,
             }
         )
-        replayed, replay = store.submit("consent", base)
+        replayed, replay, replay_claim = store.submit("consent", base, CLIENT_A)
         self.assertTrue(replay)
+        self.assertEqual(replay_claim, first_claim)
         self.assertEqual(replayed["poll_policy"]["wait_seconds"], 50)
         changed = dict(base)
         changed["exact_action"] = "Action B"
         with self.assertRaises(RelayError) as raised:
-            store.submit("consent", changed)
-            self.assertEqual(raised.exception.code, "idempotency_conflict")
+            store.submit("consent", changed, CLIENT_A)
+        self.assertEqual(raised.exception.code, "idempotency_conflict")
+
+    def test_request_id_alone_cannot_observe_or_cancel_another_claim(self) -> None:
+        store = RequestStore(elevated=False)
+        submitted, _replay, claim_token = store.submit(
+            "consent",
+            {
+                "exact_action": "Protect one claimed request.",
+                "target": "claimed test state",
+                "risk": "No external effect.",
+                "recovery": "No recovery needed.",
+                "idempotency_key": "test-store-claim-0001",
+            },
+            CLIENT_A,
+        )
+        request_id = submitted["request_id"]
+        self.assertTrue(request_id.startswith("gfr_"))
+        self.assertEqual(store.status(request_id, claim_token)["state"], "pending")
+
+        for wrong_claim in (None, CLAIM_TOKEN_PREFIX + "Z" * 43):
+            with self.assertRaises(RelayError) as raised:
+                store.status(request_id, wrong_claim)
+            self.assertEqual(raised.exception.code, "claim_mismatch")
+            with self.assertRaises(RelayError) as raised:
+                store.cancel(request_id, wrong_claim)
+            self.assertEqual(raised.exception.code, "claim_mismatch")
+
+        self.assertEqual(store.status(request_id, claim_token)["state"], "pending")
+
+    def test_idempotency_is_namespaced_by_connector_instance(self) -> None:
+        store = RequestStore(elevated=False)
+        proposal = {
+            "exact_action": "Create one connector-scoped request.",
+            "target": "connector isolation test",
+            "risk": "No external effect.",
+            "recovery": "Reject either independent card.",
+            "idempotency_key": "test-store-scope-0001",
+        }
+        first, first_replay, first_claim = store.submit(
+            "consent",
+            proposal,
+            CLIENT_A,
+        )
+        second, second_replay, second_claim = store.submit(
+            "consent",
+            proposal,
+            CLIENT_B,
+        )
+        self.assertFalse(first_replay)
+        self.assertFalse(second_replay)
+        self.assertNotEqual(first["request_id"], second["request_id"])
+        self.assertNotEqual(first_claim, second_claim)
+        self.assertNotEqual(
+            first["claim_fingerprint"],
+            second["claim_fingerprint"],
+        )
+        first_detail = store.detail_for_gui(first["request_id"])["frozen"]
+        second_detail = store.detail_for_gui(second["request_id"])["frozen"]
+        self.assertEqual(len(first_detail["connector_fingerprint"]), 12)
+        self.assertNotEqual(
+            first_detail["connector_fingerprint"],
+            second_detail["connector_fingerprint"],
+        )
+
+    def test_connector_instance_ids_are_random_and_bounded(self) -> None:
+        first = new_client_instance_id()
+        second = new_client_instance_id()
+        self.assertTrue(first.startswith("gfi_"))
+        self.assertNotEqual(first, second)
+        self.assertLessEqual(len(first), 132)
 
     def test_window_policy_is_frozen_and_pending_poll_limit_expires(self) -> None:
         store = RequestStore(
@@ -195,7 +608,7 @@ class StoreTests(unittest.TestCase):
                 "command_timeout_seconds": 120,
             },
         )
-        submitted, _replay = store.submit(
+        submitted, _replay, claim_token = store.submit(
             "consent",
             {
                 "exact_action": "Wait for a bounded polling test.",
@@ -205,6 +618,7 @@ class StoreTests(unittest.TestCase):
                 "idempotency_key": "test-store-policy-0001",
                 "approved_reply": "同意",
             },
+            CLIENT_A,
         )
         self.assertEqual(submitted["poll_policy"]["wait_seconds"], 10)
         self.assertEqual(submitted["poll_policy"]["max_pending_polls"], 3)
@@ -213,7 +627,7 @@ class StoreTests(unittest.TestCase):
         request_id = submitted["request_id"]
         with store._condition:
             store._records[request_id].pending_polls_used = 3
-        snapshot = store.wait(request_id, 1)
+        snapshot = store.wait(request_id, claim_token, 1)
         self.assertEqual(snapshot["state"], "expired")
         self.assertEqual(snapshot["poll_policy"]["pending_polls_used"], 3)
 
@@ -237,7 +651,7 @@ class StoreTests(unittest.TestCase):
                 "command_timeout_seconds": 5_000,
             },
         )
-        submitted, _replay = store.submit(
+        submitted, _replay, _claim_token = store.submit(
             "consent",
             {
                 "exact_action": "Use the configured default pending budget.",
@@ -247,11 +661,12 @@ class StoreTests(unittest.TestCase):
                 "idempotency_key": "test-store-policy-0002",
                 "approved_reply": "同意",
             },
+            CLIENT_A,
         )
         detail = store.detail_for_gui(submitted["request_id"])
         self.assertEqual(detail["frozen"]["expires_in_seconds"], 5_000)
         with tempfile.TemporaryDirectory() as temporary_directory:
-            command, _replay = store.submit(
+            command, _replay, _claim_token = store.submit(
                 "command",
                 {
                     "exact_action": "Use the configured default command timeout.",
@@ -263,9 +678,44 @@ class StoreTests(unittest.TestCase):
                     "arguments": ["-c", "print('not started')"],
                     "working_directory": temporary_directory,
                 },
+                CLIENT_A,
             )
             command_detail = store.detail_for_gui(command["request_id"])
             self.assertEqual(command_detail["frozen"]["timeout_seconds"], 5_000)
+
+    def test_graceful_window_shutdown_marks_pending_request_with_reason(self) -> None:
+        store = RequestStore(elevated=False)
+        submitted, _replay, claim_token = store.submit(
+            "consent",
+            {
+                "exact_action": "Wait for the window-shutdown contract test.",
+                "target": "one pending test card",
+                "risk": "No external effect.",
+                "recovery": "The store shutdown cancels the card.",
+                "idempotency_key": "test-window-shutdown-0001",
+                "approved_reply": "同意",
+            },
+            CLIENT_A,
+        )
+        store.shutdown()
+        self.assertTrue(store.is_stopping())
+        snapshot = store.status(submitted["request_id"], claim_token)
+        self.assertEqual(snapshot["state"], "cancelled")
+        self.assertEqual(snapshot["result"]["reason_code"], "relay_window_closed")
+
+        with self.assertRaises(RelayError) as raised:
+            store.submit(
+                "consent",
+                {
+                    "exact_action": "Do not accept a new card while closing.",
+                    "target": "stopping Broker",
+                    "risk": "No external effect.",
+                    "recovery": "Restart the window or cancel the scope.",
+                    "idempotency_key": "test-window-shutdown-0002",
+                },
+                CLIENT_A,
+            )
+        self.assertEqual(raised.exception.code, "broker_stopping")
 
 
 class AppearanceTests(unittest.TestCase):
@@ -348,6 +798,88 @@ class AppearanceTests(unittest.TestCase):
                 },
             )
 
+    def test_install_diagnostics_are_sanitized_and_detect_exact_cache(self) -> None:
+        class FakeServer:
+            @staticmethod
+            def connector_snapshot() -> dict[str, object]:
+                return {
+                    "seen_at": "2026-08-29T00:00:00Z",
+                    "connector_version": PACKAGE_VERSION,
+                    "connector_build_id": RUNTIME_BUILD_ID,
+                    "connector_fingerprint": "0123456789ab",
+                }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            codex_home = Path(temporary_directory) / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                '[plugins."golden-finger@personal"]\nenabled = true\n',
+                encoding="utf-8",
+            )
+            cached = (
+                codex_home
+                / "plugins"
+                / "cache"
+                / "personal"
+                / "golden-finger"
+                / PACKAGE_VERSION
+            )
+            cached.mkdir(parents=True)
+            (cached / "BUILD-ID.txt").write_text(
+                RUNTIME_BUILD_ID + "\n",
+                encoding="ascii",
+            )
+            diagnostics = collect_install_diagnostics(
+                FakeServer(),
+                codex_home=codex_home,
+            )
+            self.assertTrue(diagnostics["plugin_enabled"])
+            self.assertTrue(diagnostics["exact_version_cached"])
+            self.assertTrue(diagnostics["exact_build_cached"])
+            self.assertTrue(diagnostics["component_match"])
+            rendered = format_install_diagnostics(diagnostics)
+            self.assertNotIn("claim_token", rendered)
+            self.assertNotIn(CLAIM_TOKEN_PREFIX, rendered)
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Objects are Windows-only")
+    def test_windows_job_object_can_be_created_without_a_process(self) -> None:
+        job = WindowsJob.create()
+        try:
+            self.assertTrue(job.active)
+        finally:
+            job.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Objects are Windows-only")
+    def test_windows_job_object_terminates_a_contained_process(self) -> None:
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+        )
+        job = WindowsJob.create()
+        try:
+            job.assign(process)
+            job.terminate(91)
+            self.assertEqual(process.wait(timeout=5), 91)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            job.close()
+
+    def test_broker_self_test_writes_a_sanitized_runtime_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "self-test.json"
+            result = write_broker_self_test(destination)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["broker_version"], PACKAGE_VERSION)
+            self.assertEqual(result["broker_build_id"], RUNTIME_BUILD_ID)
+            rendered = destination.read_text(encoding="utf-8")
+            self.assertNotIn("token", rendered.casefold())
+
 
 class MCPShapeTests(unittest.TestCase):
     def test_tool_surface_has_no_approve_tool(self) -> None:
@@ -364,10 +896,291 @@ class MCPShapeTests(unittest.TestCase):
         )
         self.assertFalse(any("approve" in name for name in names))
 
+    def test_wait_and_cancel_require_the_per_request_claim(self) -> None:
+        tools_by_name = {tool["name"]: tool for tool in TOOLS}
+        for name in ("wait_for_authorization", "cancel_authorization"):
+            schema = tools_by_name[name]["inputSchema"]
+            self.assertIn("request_id", schema["required"])
+            self.assertIn("claim_token", schema["required"])
+            self.assertIn("claim_token", schema["properties"])
+            self.assertNotIn("client_instance_id", schema["properties"])
+
+    def test_new_request_schemas_require_cross_project_source_evidence(self) -> None:
+        tools_by_name = {tool["name"]: tool for tool in TOOLS}
+        for name in ("request_consent", "request_command_execution"):
+            schema = tools_by_name[name]["inputSchema"]
+            for field in ("source_label", "source_project", "source_task"):
+                self.assertIn(field, schema["required"])
+                self.assertIn(field, schema["properties"])
+
+    def test_host_thread_metadata_is_forwarded_outside_the_frozen_request(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        class HealthyRelayClient:
+            def call(self, operation: str, **parameters: object) -> dict[str, object]:
+                calls.append((operation, parameters))
+                return {
+                    "ok": True,
+                    "protocol": PROTOCOL_VERSION,
+                    "broker_version": PACKAGE_VERSION,
+                    "broker_build_id": RUNTIME_BUILD_ID,
+                }
+
+        with patch.object(relay_mcp_server, "RelayClient", HealthyRelayClient):
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 701,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "relay_health",
+                        "arguments": {},
+                        "_meta": {"openai/threadId": THREAD_A},
+                    },
+                }
+            )
+        self.assertEqual(response["id"], 701)
+        self.assertEqual(calls, [("health", {"client_instance_id": relay_mcp_server.CLIENT_INSTANCE_ID, "codex_thread_id": THREAD_A})])
+
+        with (
+            patch.object(relay_mcp_server, "RelayClient", HealthyRelayClient),
+            patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD_B}),
+        ):
+            handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 702,
+                    "method": "tools/call",
+                    "params": {"name": "relay_health", "arguments": {}},
+                }
+            )
+        self.assertEqual(calls[-1][1]["codex_thread_id"], THREAD_B)
+
+    def test_health_unavailable_returns_scope_recovery_without_submitting(self) -> None:
+        calls: list[str] = []
+
+        class UnavailableRelayClient:
+            def call(self, operation: str, **_parameters: object) -> dict[str, object]:
+                calls.append(operation)
+                raise RelayError(
+                    "broker_unavailable",
+                    "The independent relay window is not running.",
+                )
+
+        with patch.object(relay_mcp_server, "RelayClient", UnavailableRelayClient):
+            result = relay_mcp_server.call_tool("relay_health", {})
+
+        self.assertEqual(calls, ["health"])
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["reachable"])
+        self.assertEqual(result["window_state"], "not_running_or_unreachable")
+        recovery = result["scope_recovery"]
+        self.assertFalse(recovery["scope_is_authorization"])
+        self.assertTrue(recovery["must_ask_user"])
+        self.assertFalse(recovery["background_monitoring_supported"])
+        self.assertEqual(
+            [choice["id"] for choice in recovery["choices"]],
+            ["start_window", "cancel_scope"],
+        )
+
+    def test_health_does_not_mislabel_protocol_mismatch_as_closed_window(self) -> None:
+        class IncompatibleRelayClient:
+            def call(self, _operation: str, **_parameters: object) -> dict[str, object]:
+                raise RelayError(
+                    "protocol_mismatch",
+                    "The relay window and plugin use different protocol versions.",
+                )
+
+        with patch.object(relay_mcp_server, "RelayClient", IncompatibleRelayClient):
+            with self.assertRaises(RelayError) as raised:
+                relay_mcp_server.call_tool("relay_health", {})
+        self.assertEqual(raised.exception.code, "protocol_mismatch")
+
+    def test_health_stopping_returns_closing_scope_recovery(self) -> None:
+        class StoppingRelayClient:
+            def call(self, operation: str, **_parameters: object) -> dict[str, object]:
+                self.assert_operation(operation)
+                raise RelayError("broker_stopping", "The relay window is stopping.")
+
+            @staticmethod
+            def assert_operation(operation: str) -> None:
+                if operation != "health":
+                    raise AssertionError(f"unexpected operation: {operation}")
+
+        with patch.object(relay_mcp_server, "RelayClient", StoppingRelayClient):
+            result = relay_mcp_server.call_tool("relay_health", {})
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["reachable"])
+        self.assertEqual(result["window_state"], "closing")
+        self.assertEqual(result["reason_code"], "broker_stopping")
+        self.assertEqual(
+            result["scope_recovery"]["reason_code"],
+            "relay_window_closing",
+        )
+
+    def test_request_unavailability_returns_same_start_or_cancel_choices(self) -> None:
+        class UnavailableRelayClient:
+            def call(self, _operation: str, **_parameters: object) -> dict[str, object]:
+                raise RelayError(
+                    "broker_unavailable",
+                    "The independent relay window became unavailable.",
+                )
+
+        with patch.object(relay_mcp_server, "RelayClient", UnavailableRelayClient):
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 710,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "request_consent",
+                        "arguments": {
+                            "exact_action": "Create no card because the window is absent.",
+                            "target": "MCP recovery test",
+                            "risk": "No external effect.",
+                            "recovery": "Start the window or cancel the scope.",
+                            "idempotency_key": "test-scope-recovery-0001",
+                        },
+                    },
+                }
+            )
+        assert response is not None
+        tool_result = response["result"]
+        self.assertTrue(tool_result["isError"])
+        structured = tool_result["structuredContent"]
+        self.assertEqual(structured["error"]["code"], "broker_unavailable")
+        self.assertEqual(
+            [choice["id"] for choice in structured["scope_recovery"]["choices"]],
+            ["start_window", "cancel_scope"],
+        )
+
+    def test_request_while_window_is_stopping_returns_scope_recovery(self) -> None:
+        class StoppingRelayClient:
+            def call(self, _operation: str, **_parameters: object) -> dict[str, object]:
+                raise RelayError("broker_stopping", "The relay window is stopping.")
+
+        with patch.object(relay_mcp_server, "RelayClient", StoppingRelayClient):
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 711,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "request_consent",
+                        "arguments": {
+                            "exact_action": "Create no card while the window closes.",
+                            "target": "MCP shutdown-race test",
+                            "risk": "No external effect.",
+                            "recovery": "Restart the window or cancel the scope.",
+                            "idempotency_key": "test-scope-recovery-0002",
+                        },
+                    },
+                }
+            )
+        assert response is not None
+        structured = response["result"]["structuredContent"]
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(structured["error"]["code"], "broker_stopping")
+        self.assertEqual(
+            structured["scope_recovery"]["reason_code"],
+            "relay_window_closing",
+        )
+
+    def test_graceful_window_close_returns_scope_recovery_and_no_resume_claim(self) -> None:
+        class ClosedRelayClient:
+            def call(self, operation: str, **_parameters: object) -> dict[str, object]:
+                if operation != "wait":
+                    raise AssertionError(f"unexpected operation: {operation}")
+                return {
+                    "ok": True,
+                    "request": {
+                        "request_id": "gfr_WindowClosed",
+                        "state": "cancelled",
+                        "result": {
+                            "decision": "cancelled",
+                            "reason_code": "relay_window_closed",
+                            "message": "The relay window closed before a decision.",
+                        },
+                    },
+                }
+
+        with patch.object(relay_mcp_server, "RelayClient", ClosedRelayClient):
+            result = relay_mcp_server.call_tool(
+                "wait_for_authorization",
+                {
+                    "request_id": "gfr_WindowClosed",
+                    "claim_token": TEST_CLAIM,
+                    "wait_seconds": 0,
+                },
+            )
+        self.assertEqual(result["request"]["state"], "cancelled")
+        self.assertFalse(result["scope_recovery"]["old_request_resumable_after_restart"])
+        self.assertIn("cannot resume this request", result["continuation"])
+
+    def test_new_request_binds_instance_and_returns_exact_claim_arguments(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        class FakeRelayClient:
+            def call(self, operation: str, **parameters: object) -> dict[str, object]:
+                calls.append((operation, parameters))
+                self.assert_submit(operation)
+                return {
+                    "ok": True,
+                    "request": {
+                        "request_id": "gfr_BoundRequest",
+                        "claim_fingerprint": "0123456789ab",
+                        "state": "pending",
+                        "poll_policy": {
+                            "wait_seconds": 17,
+                            "pending_polls_used": 0,
+                            "pending_polls_remaining": 8,
+                        },
+                    },
+                    "claim_token": TEST_CLAIM,
+                    "idempotent_replay": False,
+                }
+
+            @staticmethod
+            def assert_submit(operation: str) -> None:
+                if operation != "submit":
+                    raise AssertionError(f"unexpected operation: {operation}")
+
+        relay_mcp_server._RPC_REQUEST_CLAIMS.clear()
+        with patch.object(relay_mcp_server, "RelayClient", FakeRelayClient):
+            result = relay_mcp_server.call_tool(
+                "request_consent",
+                {
+                    "exact_action": "Create one bound request.",
+                    "target": "MCP contract test",
+                    "risk": "No external effect.",
+                    "recovery": "No recovery needed.",
+                    "idempotency_key": "test-mcp-binding-0001",
+                    "wait_seconds": 0,
+                },
+                rpc_request_id=77,
+            )
+        self.assertEqual(calls[0][0], "submit")
+        self.assertEqual(
+            calls[0][1]["client_instance_id"],
+            relay_mcp_server.CLIENT_INSTANCE_ID,
+        )
+        self.assertNotIn("client_instance_id", result["request"])
+        self.assertEqual(result["claim_token"], TEST_CLAIM)
+        self.assertEqual(
+            result["polling"]["next_arguments"],
+            {
+                "request_id": "gfr_BoundRequest",
+                "claim_token": TEST_CLAIM,
+                "wait_seconds": 17,
+            },
+        )
+        relay_mcp_server._RPC_REQUEST_CLAIMS.clear()
+
     def test_active_state_requires_same_turn_polling(self) -> None:
         active = _polling_directive(
             {
-                "request_id": "har_TestRequest",
+                "request_id": "gfr_TestRequest",
                 "state": "running",
                 "poll_policy": {
                     "wait_seconds": 12,
@@ -375,20 +1188,26 @@ class MCPShapeTests(unittest.TestCase):
                     "pending_polls_remaining": 9,
                     "policy_revision": "test-policy",
                 },
-            }
+            },
+            TEST_CLAIM,
         )
         self.assertFalse(active["terminal"])
         self.assertTrue(active["must_continue_current_turn"])
         self.assertEqual(active["next_tool"], "wait_for_authorization")
         self.assertEqual(
             active["next_arguments"],
-            {"request_id": "har_TestRequest", "wait_seconds": 12},
+            {
+                "request_id": "gfr_TestRequest",
+                "claim_token": TEST_CLAIM,
+                "wait_seconds": 12,
+            },
         )
         self.assertEqual(active["pending_polls_remaining"], 9)
         self.assertTrue(active["do_not_wait_for_user_message"])
 
         fallback = _polling_directive(
-            {"request_id": "har_DefaultPolicy", "state": "pending"}
+            {"request_id": "gfr_DefaultPolicy", "state": "pending"},
+            TEST_CLAIM,
         )
         self.assertEqual(
             fallback["next_arguments"]["wait_seconds"],
@@ -397,10 +1216,68 @@ class MCPShapeTests(unittest.TestCase):
         self.assertEqual(DEFAULT_PENDING_POLL_CYCLES, 72)
 
         terminal = _polling_directive(
-            {"request_id": "har_TestRequest", "state": "completed"}
+            {"request_id": "gfr_TestRequest", "state": "completed"},
+            TEST_CLAIM,
         )
         self.assertTrue(terminal["terminal"])
         self.assertFalse(terminal["must_continue_current_turn"])
+
+    def test_mcp_cancellation_notification_cancels_the_claimed_pending_card(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        class FakeRelayClient:
+            def call(self, operation: str, **parameters: object) -> dict[str, object]:
+                calls.append((operation, parameters))
+                return {
+                    "ok": True,
+                    "request": {
+                        "request_id": "gfr_CancelledRequest",
+                        "state": "cancelled",
+                    },
+                }
+
+        relay_mcp_server._RPC_REQUEST_CLAIMS.clear()
+        relay_mcp_server._remember_rpc_claim(
+            91,
+            "gfr_CancelledRequest",
+            TEST_CLAIM,
+        )
+        with patch.object(relay_mcp_server, "RelayClient", FakeRelayClient):
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 91, "reason": "test cancellation"},
+                }
+            )
+        self.assertIsNone(response)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "cancel",
+                    {
+                        "request_id": "gfr_CancelledRequest",
+                        "claim_token": TEST_CLAIM,
+                        "client_instance_id": relay_mcp_server.CLIENT_INSTANCE_ID,
+                    },
+                )
+            ],
+        )
+        self.assertFalse(relay_mcp_server._RPC_REQUEST_CLAIMS)
+
+    def test_reused_rpc_id_drops_the_previous_claim_mapping(self) -> None:
+        relay_mcp_server._RPC_REQUEST_CLAIMS.clear()
+        relay_mcp_server._remember_rpc_claim(12, "gfr_OldRequest", TEST_CLAIM)
+        response = handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "ping",
+            }
+        )
+        self.assertEqual(response, {"jsonrpc": "2.0", "id": 12, "result": {}})
+        self.assertFalse(relay_mcp_server._RPC_REQUEST_CLAIMS)
 
     def test_initialize_advertises_tools_only(self) -> None:
         response = handle_request(
@@ -414,6 +1291,8 @@ class MCPShapeTests(unittest.TestCase):
         assert response is not None
         self.assertEqual(response["result"]["protocolVersion"], "2025-06-18")
         self.assertEqual(response["result"]["capabilities"], {"tools": {"listChanged": False}})
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.0")
+        self.assertEqual(PROTOCOL_VERSION, 4)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ import secrets
 import sys
 import time
 
-from relay_protocol import RelayClient, RelayError
+from relay_protocol import RelayClient, RelayError, new_client_instance_id
 
 
 TERMINAL_STATES = {
@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
 
 def submit(scenario: str) -> dict:
     client = RelayClient()
+    client_instance_id = new_client_instance_id()
     key = "manual-smoke-" + secrets.token_hex(12)
     common = {
         "target": "Golden Finger for Codex smoke-test state only",
@@ -49,6 +50,8 @@ def submit(scenario: str) -> dict:
         "expires_in_seconds": 300,
         "idempotency_key": key,
         "source_label": "External manual smoke client",
+        "source_project": str(Path(__file__).resolve().parents[1]),
+        "source_task": f"manual smoke: {scenario}",
     }
     if scenario == "consent":
         kind = "consent"
@@ -68,14 +71,21 @@ def submit(scenario: str) -> dict:
             "timeout_seconds": 15,
         }
 
-    submitted = client.call("submit", kind=kind, payload=payload)
+    submitted = client.call(
+        "submit",
+        kind=kind,
+        payload=payload,
+        client_instance_id=client_instance_id,
+    )
     snapshot = submitted["request"]
+    claim_token = submitted["claim_token"]
     print(
         json.dumps(
             {
                 "submitted": True,
                 "request_id": snapshot["request_id"],
                 "request_hash": snapshot["request_hash"],
+                "claim_fingerprint": snapshot["claim_fingerprint"],
                 "state": snapshot["state"],
             },
             ensure_ascii=False,
@@ -91,7 +101,9 @@ def submit(scenario: str) -> dict:
         response = client.call(
             "wait",
             request_id=snapshot["request_id"],
+            claim_token=claim_token,
             wait_seconds=wait_seconds,
+            client_instance_id=client_instance_id,
         )
         snapshot = response["request"]
         print(f"state={snapshot['state']}", flush=True)

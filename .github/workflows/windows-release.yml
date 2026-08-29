@@ -1,0 +1,37 @@
+name: Windows release verification
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install build dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-build.txt
+      - name: Unit and static validation
+        run: |
+          $env:PYTHONUTF8 = "1"
+          python -m unittest discover -s tests -v
+          python scripts/static_validate.py
+      - name: Build self-contained plugin
+        run: python scripts/build_windows_release.py
+      - name: Verify release hashes and MCP executable
+        run: python scripts/verify_windows_release.py dist/golden-finger-0.2.0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: golden-finger-0.2.0-windows-x64
+          path: dist/golden-finger-0.2.0-windows-x64.zip
+          if-no-files-found: error

@@ -1,6 +1,6 @@
 {
   "name": "golden-finger",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "Golden Finger for Codex — a local human-authorization relay for one-time consent and exact command execution, made for the Yes工程师 workflow.",
   "author": {
     "name": "Golden Finger for Codex Project"
@@ -19,10 +19,19 @@
       "Non-click-through Codex-themed 60% acrylic window with fully opaque text",
       "Latest-request foreground and optional sound alerts",
       "Responsive minimum-size layout with a fixed approval bar",
-      "Compact live polling policy with an automatically derived total timeout"
+      "Compact live polling policy with an automatically derived total timeout",
+      "Per-request capability claiming across concurrent projects",
+      "Human-readable project/task origin labels plus a non-secret connector fingerprint",
+      "Exact connector/Broker version and build handshake",
+      "Executable and direct-script SHA-256 re-verification before launch",
+      "Windows Job Object process-tree containment",
+      "Sanitized in-window installation diagnostics",
+      "Self-contained Windows EXE release build and clean-machine verification",
+      "Intent-based one-time consent triggering across common Chinese and English approval wording",
+      "User-global plugin runtime with first-use routing scopes and structured start-window or cancel-scope recovery"
     ],
     "defaultPrompt": [
-      "\u4f7f\u7528 Codex\u91d1\u624b\u6307\uff08\u4eba\u673a\u6388\u6743\u4e2d\u7ee7\uff09\uff0c\u4e3a\u5f53\u524d\u552f\u4e00\u52a8\u4f5c\u8bf7\u6c42\u4e00\u6b21\u660e\u786e\u7684\u4eba\u7c7b\u786e\u8ba4\uff1b\u82e5\u4ecd\u4e3a pending/running\uff0c\u4fdd\u6301\u5f53\u524d\u56de\u5408\u5e76\u4e25\u683c\u6309\u7167\u54cd\u5e94\u4e2d\u7684\u4e0b\u4e00\u6b21\u53c2\u6570\u8f6e\u8be2\u5230\u7ec8\u6001\u3002"
+      "\u4f7f\u7528 Codex\u91d1\u624b\u6307\uff08\u4eba\u673a\u6388\u6743\u4e2d\u7ee7\uff09\u5904\u7406\u5f53\u524d\u52a8\u4f5c\uff1b\u9996\u6b21\u91c7\u7528\u5148\u7ea6\u5b9a\u4f7f\u7528\u4f5c\u7528\u57df\u5e76\u68c0\u67e5\u7a97\u53e3\uff0c\u4e0d\u53ef\u8fbe\u65f6\u8be2\u95ee\u542f\u52a8\u6216\u53d6\u6d88\u4f5c\u7528\u57df\uff1bpending/running \u6309\u54cd\u5e94\u53c2\u6570\u8f6e\u8be2\u5230\u7ec8\u6001\u3002"
     ]
   },
   "mcpServers": "./.mcp.json"

@@ -15,17 +15,26 @@ import secrets
 import shutil
 import socket
 import stat
+import sys
 import tempfile
 from typing import Any
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 4
+PACKAGE_VERSION = "0.2.0"
+PACKAGE_BUILD_ID = "source"
 PRODUCT_NAME = "GoldenFinger"
 ENDPOINT_FILENAME = "endpoint.json"
+REQUEST_ID_PREFIX = "gfr_"
+CLIENT_INSTANCE_PREFIX = "gfi_"
+CLAIM_TOKEN_PREFIX = "gfcap_"
+CLAIM_FINGERPRINT_HEX_LENGTH = 12
 MAX_WIRE_BYTES = 1_048_576
 MAX_PENDING_REQUESTS = 16
 MAX_OUTPUT_BYTES = 262_144
 MAX_EXECUTABLE_BYTES = 1_073_741_824
+MAX_SCRIPT_BYTES = 67_108_864
+SCRIPT_EXTENSIONS = frozenset({".bat", ".cmd", ".ps1", ".py", ".pyw"})
 MIN_APPROVAL_EXPIRY_SECONDS = 10
 DEFAULT_APPROVAL_EXPIRY_SECONDS = 3_600
 MAX_APPROVAL_EXPIRY_SECONDS = 36_000
@@ -92,6 +101,32 @@ def canonical_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def runtime_build_id() -> str:
+    """Identify the exact source/runtime bundle shared by MCP and Broker."""
+
+    if getattr(sys, "frozen", False) or PACKAGE_BUILD_ID != "source":
+        return PACKAGE_BUILD_ID
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in ("relay_protocol.py", "relay_mcp_server.py", "relay_broker.py"):
+        path = root / name
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise RelayError(
+                "runtime_unreadable",
+                f"Golden Finger runtime component {name!r} could not be read.",
+            ) from exc
+        digest.update(name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+    return "src-" + digest.hexdigest()[:24]
+
+
+RUNTIME_BUILD_ID = runtime_build_id()
+
+
 def endpoint_directory() -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
@@ -107,6 +142,45 @@ def endpoint_path() -> Path:
 
 def new_bearer_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def new_client_instance_id() -> str:
+    """Return an opaque namespace for one MCP connector process."""
+
+    return CLIENT_INSTANCE_PREFIX + secrets.token_urlsafe(24)
+
+
+def normalize_client_instance_id(value: Any) -> str:
+    """Validate a bounded connector namespace without treating it as task identity."""
+
+    if not isinstance(value, str) or not value.startswith(CLIENT_INSTANCE_PREFIX):
+        raise RelayError(
+            "invalid_client_instance",
+            "client_instance_id is missing or invalid.",
+        )
+    suffix = value[len(CLIENT_INSTANCE_PREFIX) :]
+    if not (24 <= len(suffix) <= 128) or any(
+        not (character.isascii() and (character.isalnum() or character in "-_"))
+        for character in suffix
+    ):
+        raise RelayError(
+            "invalid_client_instance",
+            "client_instance_id is missing or invalid.",
+        )
+    return value
+
+
+def new_claim_token() -> str:
+    """Return the capability required to observe or cancel one request."""
+
+    return CLAIM_TOKEN_PREFIX + secrets.token_urlsafe(32)
+
+
+def claim_fingerprint(claim_token: str) -> str:
+    """Return a short non-secret correlation value for the relay UI."""
+
+    digest = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+    return digest[:CLAIM_FINGERPRINT_HEX_LENGTH]
 
 
 def write_endpoint(metadata: dict[str, Any]) -> Path:
@@ -168,6 +242,8 @@ def read_endpoint() -> dict[str, Any]:
 
     required = {
         "protocol": int,
+        "broker_version": str,
+        "broker_build_id": str,
         "host": str,
         "port": int,
         "token": str,
@@ -184,6 +260,20 @@ def read_endpoint() -> dict[str, Any]:
         raise RelayError(
             "protocol_mismatch",
             "The relay window and plugin use different protocol versions.",
+        )
+    if (
+        metadata["broker_version"] != PACKAGE_VERSION
+        or metadata["broker_build_id"] != RUNTIME_BUILD_ID
+    ):
+        raise RelayError(
+            "component_mismatch",
+            "The Golden Finger plugin and relay window are different builds.",
+            details={
+                "expected_version": PACKAGE_VERSION,
+                "observed_broker_version": metadata["broker_version"],
+                "expected_build_id": RUNTIME_BUILD_ID,
+                "observed_broker_build_id": metadata["broker_build_id"],
+            },
         )
     if metadata["host"] != "127.0.0.1":
         raise RelayError("invalid_endpoint", "Relay endpoint is not loopback-only.")
@@ -374,6 +464,158 @@ def fingerprint_executable(executable: str) -> tuple[int, str]:
     return file_stat.st_size, digest.hexdigest()
 
 
+def fingerprint_script(script_path: str) -> tuple[int, str]:
+    """Return a bounded size and SHA-256 fingerprint for one direct script input."""
+
+    path = Path(script_path)
+    try:
+        file_stat = path.stat()
+    except OSError as exc:
+        raise RelayError(
+            "script_not_found",
+            "A direct script dependency can no longer be read.",
+            details={"path": str(path)},
+        ) from exc
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise RelayError(
+            "invalid_request",
+            "A direct script dependency is not a regular file.",
+            details={"path": str(path)},
+        )
+    if file_stat.st_size > MAX_SCRIPT_BYTES:
+        raise RelayError(
+            "unsupported_script",
+            "A direct script dependency exceeds the 64 MiB fingerprinting limit.",
+            details={"path": str(path)},
+        )
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1_048_576)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        final_stat = path.stat()
+    except OSError as exc:
+        raise RelayError(
+            "script_unreadable",
+            "A direct script dependency could not be fingerprinted.",
+            details={"path": str(path)},
+        ) from exc
+    if (
+        final_stat.st_size != file_stat.st_size
+        or final_stat.st_mtime_ns != file_stat.st_mtime_ns
+        or final_stat.st_ino != file_stat.st_ino
+    ):
+        raise RelayError(
+            "script_changed",
+            "A direct script dependency changed while it was being fingerprinted.",
+            details={"path": str(path)},
+        )
+    return file_stat.st_size, digest.hexdigest()
+
+
+def _script_argument_candidates(
+    executable: str,
+    arguments: list[str],
+) -> list[tuple[int, str]]:
+    """Find direct script argv entries without interpreting a composed shell command."""
+
+    executable_name = Path(executable).name.casefold()
+    candidates: list[tuple[int, str]] = []
+    if executable_name in {"powershell.exe", "pwsh.exe", "powershell", "pwsh"}:
+        for index, argument in enumerate(arguments):
+            lowered = argument.casefold()
+            if lowered in {"-file", "-f"} and index + 1 < len(arguments):
+                candidates.append((index + 1, arguments[index + 1]))
+            elif lowered.startswith("-file:") or lowered.startswith("-file="):
+                candidates.append((index, argument[6:]))
+    elif executable_name in {"python.exe", "pythonw.exe", "python", "pythonw", "py.exe", "py"}:
+        for index, argument in enumerate(arguments):
+            lowered = argument.casefold()
+            if lowered in {"-c", "-m"}:
+                break
+            if Path(argument).suffix.casefold() in {".py", ".pyw"}:
+                candidates.append((index, argument))
+                break
+    elif executable_name in {"cmd.exe", "cmd"}:
+        for index, argument in enumerate(arguments):
+            if argument.casefold() in {"/c", "/k"} and index + 1 < len(arguments):
+                following = arguments[index + 1]
+                if Path(following).suffix.casefold() in {".bat", ".cmd"}:
+                    candidates.append((index + 1, following))
+                break
+
+    known = {(index, value) for index, value in candidates}
+    for index, argument in enumerate(arguments):
+        if Path(argument).suffix.casefold() in SCRIPT_EXTENSIONS:
+            known.add((index, argument))
+    return sorted(known)
+
+
+def freeze_script_dependencies(
+    executable: str,
+    arguments: list[str],
+    working_directory: str,
+) -> list[dict[str, Any]]:
+    """Resolve and fingerprint direct script files named by the approved argv."""
+
+    dependencies: list[dict[str, Any]] = []
+    working_path = Path(working_directory)
+    for argument_index, argument_value in _script_argument_candidates(executable, arguments):
+        requested = Path(argument_value)
+        candidate = requested if requested.is_absolute() else working_path / requested
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError) as exc:
+            raise RelayError(
+                "script_not_found",
+                "A direct script argument does not exist.",
+                details={
+                    "argument_index": argument_index,
+                    "argument_value": argument_value,
+                },
+            ) from exc
+        if resolved.suffix.casefold() not in SCRIPT_EXTENSIONS:
+            continue
+        size, sha256 = fingerprint_script(str(resolved))
+        dependencies.append(
+            {
+                "argument_index": argument_index,
+                "argument_value": argument_value,
+                "path": str(resolved),
+                "size": size,
+                "sha256": sha256,
+            }
+        )
+    return dependencies
+
+
+def verify_script_dependencies(
+    dependencies: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return direct script dependencies whose current bytes differ from the card."""
+
+    mismatches: list[dict[str, Any]] = []
+    for dependency in dependencies:
+        current_size, current_sha256 = fingerprint_script(str(dependency["path"]))
+        if (
+            current_size != dependency["size"]
+            or current_sha256 != dependency["sha256"]
+        ):
+            mismatches.append(
+                {
+                    "path": dependency["path"],
+                    "expected_size": dependency["size"],
+                    "observed_size": current_size,
+                    "expected_sha256": dependency["sha256"],
+                    "observed_sha256": current_sha256,
+                }
+            )
+    return mismatches
+
+
 def _enforce_protected_boundary(executable: str, arguments: list[str]) -> None:
     executable_name = Path(executable).name.casefold()
     if executable_name in {"codex", "codex.exe", "codex.cmd", "codex.com"}:
@@ -422,6 +664,8 @@ def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
         "expires_in_seconds",
         "idempotency_key",
         "source_label",
+        "source_project",
+        "source_task",
     }
     kind_fields = (
         {"approved_reply"}
@@ -465,6 +709,16 @@ def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
             payload.get("source_label", "Codex current MCP tool call"),
             "source_label",
             maximum=200,
+        ),
+        "source_project": _bounded_text(
+            payload.get("source_project", "(project not supplied)"),
+            "source_project",
+            maximum=4_096,
+        ),
+        "source_task": _bounded_text(
+            payload.get("source_task", "(task not supplied)"),
+            "source_task",
+            maximum=300,
         ),
     }
 
@@ -533,6 +787,11 @@ def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
                 "executable_sha256": executable_sha256,
                 "arguments": normalized_arguments,
                 "working_directory": str(resolved_working_path),
+                "script_dependencies": freeze_script_dependencies(
+                    resolved_executable,
+                    normalized_arguments,
+                    str(resolved_working_path),
+                ),
                 "timeout_seconds": _bounded_integer(
                     payload.get("timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS),
                     "timeout_seconds",
@@ -564,6 +823,8 @@ class RelayClient:
         )
         request = {
             "protocol": PROTOCOL_VERSION,
+            "client_version": PACKAGE_VERSION,
+            "client_build_id": RUNTIME_BUILD_ID,
             "token": self.metadata["token"],
             "operation": operation,
             **parameters,

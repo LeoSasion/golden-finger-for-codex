@@ -62,8 +62,43 @@ def validate_skill_metadata() -> None:
         metadata[key] = value
     require(metadata.get("name") == "golden-finger", "wrong Skill name")
     description = metadata.get("description", "")
-    require("同意/授权/继续" in description, "Skill trigger description is incomplete")
-    require("polling the same request" in description, "Skill polling trigger is missing")
+    require(
+        "one exact human approval or rejection regardless of wording" in description,
+        "Skill trigger must be authorization-intent-first",
+    )
+    trigger_examples = (
+        "同意",
+        "授权",
+        "批准",
+        "确认",
+        "允许",
+        "继续",
+        "拒绝",
+        "Yes",
+        "Approve",
+        "Confirm",
+        "Authorize",
+        "Allow",
+        "Proceed",
+        "Reject",
+    )
+    require(
+        all(example in description for example in trigger_examples),
+        "Skill trigger examples are incomplete",
+    )
+    require(
+        "mere acknowledgement" in description
+        and "informational confirmation" in description
+        and "preference questions" in description,
+        "Skill trigger false-positive boundaries are incomplete",
+    )
+    require("same-turn polling until terminal" in description, "Skill polling trigger is missing")
+    require(
+        "agree a routing scope" in description
+        and "scope never authorizes actions" in description
+        and "cancel the scope" in description,
+        "Skill first-use scope and recovery trigger is incomplete",
+    )
     require(
         "codex app-server generate-json-schema --out protocol" in source,
         "Skill is missing the version-matched Codex protocol schema command",
@@ -71,6 +106,10 @@ def validate_skill_metadata() -> None:
     require(
         "This command is not eligible for `request_command_execution`" in source,
         "Skill is missing the Codex schema execution boundary",
+    )
+    require(
+        all(field in source for field in ("source_label", "source_project", "source_task")),
+        "Skill is missing cross-project source evidence guidance",
     )
     require("[TODO" not in source, "SKILL contains an unfinished placeholder")
 
@@ -83,7 +122,12 @@ def validate_skill_metadata() -> None:
     )
     require('display_name: "Codex金手指"' in openai_yaml, "Skill display name drifted")
     require("Yes工程师" in openai_yaml, "Skill search phrase is missing")
+    require("首次采用先约定使用作用域" in openai_yaml, "Skill scope prompt is missing")
     require("pending/running" in openai_yaml, "Skill default prompt lacks active polling")
+    require(
+        "allow_implicit_invocation: true" in openai_yaml,
+        "Skill implicit invocation must remain enabled",
+    )
 
 
 def validate_manifest() -> None:
@@ -92,7 +136,7 @@ def validate_manifest() -> None:
     version = manifest.get("version")
     require(
         isinstance(version, str)
-        and (version == "0.1.9" or version.startswith("0.1.9+codex.")),
+        and (version == "0.2.0" or version.startswith("0.2.0+codex.")),
         "unexpected plugin version",
     )
     require(manifest.get("skills") == "./skills/", "skills path is missing")
@@ -184,7 +228,7 @@ def validate_python_sources() -> None:
 
     broker_source = load_utf8(PLUGIN_ROOT / "scripts" / "relay_broker.py")
     for appearance_marker in (
-        'BROKER_VERSION = "0.1.9"',
+        "BROKER_VERSION = PACKAGE_VERSION",
         'root.title("Codex金手指")',
         "WINDOW_BACKGROUND_OPACITY = 0.60",
         "WINDOW_HIT_SHIELD_OPACITY = 0.01",
@@ -197,7 +241,7 @@ def validate_python_sources() -> None:
         'attributes("-topmost", active)',
         "SetForegroundWindow",
         "if enabled == self._enabled:",
-        "height=44",
+        "diameter=170",
         "if requested_wait > 0",
         "winsound.MessageBeep",
         "new_request_ids",
@@ -207,14 +251,34 @@ def validate_python_sources() -> None:
         "WINDOW_MIN_CONTENT_HEIGHT = 260",
         'root.rowconfigure(1, weight=1, minsize=WINDOW_MIN_CONTENT_HEIGHT)',
         'main.grid(row=1, column=0, sticky="nsew"',
-        'actions.grid(row=2, column=0, sticky="ew")',
-        'self.approve_button.grid(row=0, column=2, sticky="e")',
+        "class CircularButton",
+        'text="进行中的任务"',
+        'text="安全重启 Codex"',
+        "detail_panel.grid_remove()",
+        "self.main.columnconfigure(2, weight=0, minsize=WINDOW_DETAIL_WIDTH)",
+        "self.approve_button.place",
+        "CodexTaskMonitor",
+        "try_begin_codex_restart",
+        "graceful_restart_codex",
+        'task.status == "systemError"',
         'text="次 = 总上限"',
         "_apply_safe_minimum_size",
         "winfo_reqheight",
         "获批命令将继承此权限",
         'trace_add("write", self._schedule_policy_update)',
         "command_timeout_seconds = pending_wait_budget_seconds",
+        "_get_claimed_locked",
+        "claim_fingerprint",
+        "secrets.compare_digest",
+        "dict[tuple[str, str], str]",
+        "class WindowsJob",
+        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+        "verify_script_dependencies",
+        "collect_install_diagnostics",
+        "format_install_diagnostics",
+        'text="诊断"',
+        "--self-test-output",
+        "connector_fingerprint",
     ):
         require(
             appearance_marker in broker_source,
@@ -228,6 +292,55 @@ def validate_python_sources() -> None:
     require(
         "警告：窗口当前以管理员权限运行" not in broker_source,
         "the removed administrator warning returned",
+    )
+    lifecycle_source = load_utf8(PLUGIN_ROOT / "scripts" / "codex_lifecycle.py")
+    for lifecycle_marker in (
+        "APP_TOOLS_SCHEMA_VERSION = 4",
+        'tool.get("name") == "list_threads"',
+        'payload.get("pinnedThreads")',
+        '"inventory_truncated"',
+        "GetNamedPipeServerProcessId",
+        "is_codex_desktop_executable(server_executable)",
+        "def is_fresh(",
+        "PostMessageW(target.hwnd, 0x0010, 0, 0)",
+        "ShellExecuteW",
+        "未强制结束进程",
+    ):
+        require(
+            lifecycle_marker in lifecycle_source,
+            f"Codex lifecycle contract is missing {lifecycle_marker!r}",
+        )
+    lifecycle_lower = lifecycle_source.casefold()
+    require("sqlite" not in lifecycle_lower, "lifecycle code must not read Codex databases")
+    require("terminateprocess" not in lifecycle_lower, "Codex restart must never force-kill")
+    mcp_source_for_lifecycle = load_utf8(
+        PLUGIN_ROOT / "scripts" / "relay_mcp_server.py"
+    )
+    require(
+        "extract_codex_thread_id(" in mcp_source_for_lifecycle
+        and 'params.get("_meta")' in mcp_source_for_lifecycle
+        and 'os.environ.get("CODEX_THREAD_ID")' in mcp_source_for_lifecycle,
+        "MCP connector must pass host thread metadata to the lifecycle monitor",
+    )
+    render_detail = next(
+        (
+            node
+            for node in ast.walk(broker_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_render_detail"
+        ),
+        None,
+    )
+    require(render_detail is not None, "GUI detail renderer is missing")
+    render_detail_source = ast.get_source_segment(broker_source, render_detail) or ""
+    require(
+        "claim_fingerprint" in render_detail_source,
+        "GUI must display the non-secret claim fingerprint",
+    )
+    require(
+        "claim_token" not in render_detail_source
+        and "client_instance_id" not in render_detail_source,
+        "GUI must never display request claim capabilities or connector IDs",
     )
 
     popen_calls = [
@@ -302,20 +415,80 @@ def validate_python_sources() -> None:
         "do_not_wait_for_user_message",
         "wait_for_authorization",
         "pending_polls_remaining",
+        "claim_token",
+        "notifications/cancelled",
     ):
         require(
             polling_marker in mcp_constants,
             f"MCP polling directive is missing {polling_marker!r}",
         )
     mcp_source = load_utf8(PLUGIN_ROOT / "scripts" / "relay_mcp_server.py")
-    require('SERVER_VERSION = "0.1.9"' in mcp_source, "MCP server version drifted")
+    require(
+        "SERVER_VERSION = PACKAGE_VERSION" in mcp_source,
+        "MCP server version must share the package version constant",
+    )
+    require(
+        "CLIENT_INSTANCE_ID = new_client_instance_id()" in mcp_source,
+        "MCP connector instance namespace is missing",
+    )
     require(
         "polling.next_arguments" in mcp_source,
         "MCP continuation must direct Codex to the broker-owned next arguments",
     )
+    require(
+        all(field in mcp_source for field in ('"source_label"', '"source_project"', '"source_task"')),
+        "MCP request schemas are missing source evidence fields",
+    )
+    for scope_marker in (
+        "routing_preference_only",
+        "start_window",
+        "cancel_scope",
+        "background_monitoring_supported",
+        "relay_window_closed",
+        "broker_stopping",
+    ):
+        require(
+            scope_marker in mcp_constants,
+            f"MCP scope recovery is missing {scope_marker!r}",
+        )
+    require(
+        '"reason_code": "relay_window_closed"' in broker_source,
+        "graceful window shutdown lacks a structured reason",
+    )
+    require(
+        "if server.store.is_stopping()" in broker_source,
+        "relay_health can falsely report healthy while the Broker is stopping",
+    )
 
     protocol_source = load_utf8(PLUGIN_ROOT / "scripts" / "relay_protocol.py")
-    require("PROTOCOL_VERSION = 2" in protocol_source, "relay protocol version must be 2")
+    require("PROTOCOL_VERSION = 4" in protocol_source, "relay protocol version must be 4")
+    require(
+        'PACKAGE_VERSION = "0.2.0"' in protocol_source,
+        "package version drifted",
+    )
+    for protocol_marker in (
+        'PACKAGE_BUILD_ID = "source"',
+        "RUNTIME_BUILD_ID = runtime_build_id()",
+        '"client_version": PACKAGE_VERSION',
+        '"client_build_id": RUNTIME_BUILD_ID',
+        "freeze_script_dependencies",
+        "verify_script_dependencies",
+        '"source_project"',
+        '"source_task"',
+    ):
+        require(
+            protocol_marker in protocol_source,
+            f"protocol contract is missing {protocol_marker!r}",
+        )
+    require(
+        'REQUEST_ID_PREFIX = "gfr_"' in protocol_source
+        and 'CLAIM_TOKEN_PREFIX = "gfcap_"' in protocol_source,
+        "request claim prefixes drifted",
+    )
+    require(
+        "har_" not in broker_source and "har_" not in mcp_source,
+        "legacy request ID prefix returned",
+    )
     require(
         "DEFAULT_APPROVAL_EXPIRY_SECONDS = 3_600" in protocol_source,
         "approval validity must default to 60 minutes",
@@ -365,11 +538,77 @@ def validate_python_sources() -> None:
         "不会穿透",
         "只应用到随后创建的新请求",
         "920 × 600",
-        "右下角",
+        "三列",
+        "大圆形",
+        "安全重启 Codex",
+        "list_threads",
         "极简公式",
         "权限横幅已移除",
+        "claim_token",
+        "认领指纹",
+        "协议版本 4",
+        "Job Object",
+        "直接命名",
+        "右上角“诊断”",
+        "精确 build ID",
+        "自包含 Windows 发行包",
+        "使用作用域与窗口生命周期",
+        "启动金手指窗口并继续作用域",
+        "取消金手指作用域",
+        "不能在 Codex 回合结束后后台监测",
     ):
         require(ui_marker in readme, f"README UI guidance is missing {ui_marker!r}")
+
+    build_source = load_utf8(PLUGIN_ROOT / "scripts" / "build_windows_release.py")
+    verify_source = load_utf8(PLUGIN_ROOT / "scripts" / "verify_windows_release.py")
+    workflow = load_utf8(
+        PLUGIN_ROOT / ".github" / "workflows" / "windows-release.yml"
+    )
+    for marker in (
+        "PyInstaller",
+        "GoldenFinger",
+        "golden-finger-mcp",
+        "codex_lifecycle.py",
+        "BUILD-ID.txt",
+        "build-manifest.json",
+    ):
+        require(marker in build_source, f"Windows release builder is missing {marker!r}")
+    for marker in (
+        "sha256_file",
+        "initialize",
+        "--self-test-output",
+        "job_object_active",
+    ):
+        require(marker in verify_source, f"Windows release verifier is missing {marker!r}")
+    require(
+        "windows-latest" in workflow
+        and "build_windows_release.py" in workflow
+        and "verify_windows_release.py" in workflow,
+        "clean Windows release workflow is incomplete",
+    )
+
+    scope_reference = load_utf8(
+        PLUGIN_ROOT
+        / "skills"
+        / "golden-finger"
+        / "references"
+        / "scope-lifecycle.md"
+    )
+    for scope_marker in (
+        "once",
+        "task",
+        "project",
+        "global",
+        "golden-finger-scope:start",
+        "AGENTS.override.md",
+        "personal/global Codex plugin environment",
+        "scope_recovery.must_ask_user=true",
+        "cannot resume an old in-memory request",
+    ):
+        require(
+            scope_marker in scope_reference,
+            f"scope lifecycle reference is missing {scope_marker!r}",
+        )
 
 
 def validate_utf8_tree() -> None:
@@ -400,7 +639,7 @@ def main() -> int:
         return 1
     print(
         "PASS: manifest, Skill metadata, UTF-8, Python syntax, polling contract, "
-        "window-policy sync, transport boundary, appearance/attention contract, "
+        "window-policy sync, request claiming, scope recovery, transport boundary, appearance/attention contract, "
         "manual launcher, and shell=False"
     )
     return 0

@@ -1,4 +1,7 @@
 interface:
   display_name: "Codex金手指"
-  short_description: "人机授权中继：Yes工程师的一键确认与命令授权窗口"
-  default_prompt: "使用 $golden-finger（Codex金手指）为这个唯一动作请求一次人类确认；若返回 pending/running，保持当前回合并严格按照响应中的下一次参数轮询到终态。"
+  short_description: "人机授权中继：先定作用域，再由Yes工程师逐次确认"
+  default_prompt: "使用 $golden-finger（Codex金手指）按授权意图处理这个动作；首次采用先约定使用作用域并检查窗口，不可达时询问启动或取消作用域；pending/running 按响应参数轮询到终态。"
+
+policy:
+  allow_implicit_invocation: true
