@@ -31,6 +31,15 @@ RUNTIME_FILES = (
 )
 
 
+def ignore_python_cache(_directory: str, names: list[str]) -> set[str]:
+    """Keep generated Python bytecode out of reproducible release payloads."""
+    return {
+        name
+        for name in names
+        if name == "__pycache__" or name.endswith((".pyc", ".pyo"))
+    }
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -64,7 +73,12 @@ def reset_directory(path: Path, parent: Path) -> None:
 
 def prepare_stage(build_id: str) -> Path:
     reset_directory(STAGE, ROOT / "build")
-    shutil.copytree(ROOT / "scripts", STAGE / "scripts", dirs_exist_ok=True)
+    shutil.copytree(
+        ROOT / "scripts",
+        STAGE / "scripts",
+        dirs_exist_ok=True,
+        ignore=ignore_python_cache,
+    )
     protocol_path = STAGE / "scripts" / "relay_protocol.py"
     source = protocol_path.read_text(encoding="utf-8")
     updated, replacements = re.subn(
@@ -134,8 +148,16 @@ def copy_plugin_payload(stage: Path, build_id: str) -> None:
     reset_directory(PACKAGE_ROOT, DIST_ROOT)
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     for directory in (".codex-plugin", "skills"):
-        shutil.copytree(ROOT / directory, PACKAGE_ROOT / directory)
-    shutil.copytree(stage / "scripts", PACKAGE_ROOT / "scripts")
+        shutil.copytree(
+            ROOT / directory,
+            PACKAGE_ROOT / directory,
+            ignore=ignore_python_cache,
+        )
+    shutil.copytree(
+        stage / "scripts",
+        PACKAGE_ROOT / "scripts",
+        ignore=ignore_python_cache,
+    )
     for name in ("README.md", "EXTERNAL-TESTING.md"):
         shutil.copy2(ROOT / name, PACKAGE_ROOT / name)
     (PACKAGE_ROOT / ".mcp.json").write_text(

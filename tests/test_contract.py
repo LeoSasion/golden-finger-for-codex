@@ -20,6 +20,7 @@ from unittest.mock import patch
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 
+from build_windows_release import ignore_python_cache
 from relay_broker import (
     RequestStore,
     RelayRequestHandler,
@@ -1293,6 +1294,17 @@ class MCPShapeTests(unittest.TestCase):
         self.assertEqual(response["result"]["capabilities"], {"tools": {"listChanged": False}})
         self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.0")
         self.assertEqual(PROTOCOL_VERSION, 4)
+
+
+class ReleasePackagingTests(unittest.TestCase):
+    def test_python_bytecode_is_excluded_from_release_trees(self) -> None:
+        self.assertEqual(
+            ignore_python_cache(
+                "ignored",
+                ["__pycache__", "relay_broker.py", "relay_broker.pyc", "legacy.pyo"],
+            ),
+            {"__pycache__", "relay_broker.pyc", "legacy.pyo"},
+        )
 
 
 if __name__ == "__main__":

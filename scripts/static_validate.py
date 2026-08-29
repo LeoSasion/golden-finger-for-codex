@@ -571,6 +571,9 @@ def validate_python_sources() -> None:
         "codex_lifecycle.py",
         "BUILD-ID.txt",
         "build-manifest.json",
+        "ignore_python_cache",
+        "__pycache__",
+        ".pyc",
     ):
         require(marker in build_source, f"Windows release builder is missing {marker!r}")
     for marker in (
