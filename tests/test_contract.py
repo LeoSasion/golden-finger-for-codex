@@ -1,11 +1,14 @@
 """External-only unit tests for Golden Finger for Codex.
 
-Run these from a user-controlled terminal. They do not launch Codex or the GUI.
-On Windows one bounded Python child verifies Job Object termination.
+Run these from a user-controlled terminal. They do not launch Codex or any
+user-visible GUI. On Windows, one hidden Tk control verifies native button
+semantics and one bounded Python child verifies Job Object termination.
 """
 
 from __future__ import annotations
 
+import ctypes
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -13,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import tkinter as tk
 import unittest
 from unittest.mock import patch
 
@@ -22,20 +26,33 @@ sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 
 from build_windows_release import ignore_python_cache
 from relay_broker import (
+    GUI_TERMINAL_HISTORY_LIMIT,
+    THEME_PALETTES,
+    CircularButton,
     RequestStore,
+    RelayWindow,
     RelayRequestHandler,
     RelayTCPServer,
     WindowsJob,
     WINDOW_HIT_SHIELD_OPACITY,
     WINDOW_MIN_HEIGHT,
     WINDOW_MIN_WIDTH,
+    WINDOW_SNAP_MIN_WIDTH,
+    antialiased_circle_coverage,
     acrylic_gradient_color,
+    circular_button_visual_state,
     collect_install_diagnostics,
+    contrast_ratio,
+    decision_button_layout,
+    ellipsize_display_text,
+    empty_state_copy,
     execution_mode_label,
     format_install_diagnostics,
     load_ui_settings,
     normalize_poll_policy,
     read_codex_theme_preference,
+    relay_connection_summary,
+    responsive_window_layout,
     resolve_theme,
     safe_transparent_client,
     save_ui_settings,
@@ -217,7 +234,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frozen["kind"], "consent")
         self.assertEqual(len(frozen["request_hash"]), 64)
         self.assertEqual(frozen["approved_reply"], "同意")
-        self.assertEqual(frozen["expires_in_seconds"], 3_600)
+        self.assertEqual(frozen["expires_in_seconds"], 9_000)
 
     def test_source_labels_are_frozen_but_explicitly_human_readable(self) -> None:
         frozen = normalize_request(
@@ -236,7 +253,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frozen["source_project"], "C:\\finger")
         self.assertEqual(frozen["source_task"], "Golden Finger contract tests")
 
-    def test_command_defaults_to_one_hour_and_rejects_above_hard_bound(self) -> None:
+    def test_command_defaults_to_fixed_budget_and_rejects_above_hard_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             payload = {
                 "exact_action": "Wait for one bounded test command.",
@@ -461,6 +478,67 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(RelayError):
             store.approve_from_gui(submitted["request_id"])
 
+    def test_gui_stop_is_neither_decision_and_wakes_a_long_wait(self) -> None:
+        store = RequestStore(elevated=False)
+        submitted, _replay, claim_token = store.submit(
+            "consent",
+            {
+                "exact_action": "Wait until the user stops this test.",
+                "target": "one pending test request",
+                "risk": "No external effect.",
+                "recovery": "No recovery needed.",
+                "idempotency_key": "test-store-stop-0001",
+                "approved_reply": "同意",
+            },
+            CLIENT_A,
+        )
+        request_id = submitted["request_id"]
+        waiter_started = threading.Event()
+        result: dict[str, object] = {}
+
+        def wait_for_result() -> None:
+            waiter_started.set()
+            result["snapshot"] = store.wait(
+                request_id,
+                claim_token,
+                DEFAULT_POLL_WAIT_SECONDS,
+            )
+
+        waiter = threading.Thread(target=wait_for_result, daemon=True)
+        waiter.start()
+        try:
+            self.assertTrue(waiter_started.wait(timeout=1))
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                snapshot = store.status(request_id, claim_token)
+                if snapshot["poll_policy"]["pending_polls_used"] == 1:
+                    break
+                time.sleep(0.005)
+            self.assertEqual(
+                store.status(request_id, claim_token)["poll_policy"][
+                    "pending_polls_used"
+                ],
+                1,
+            )
+
+            stopped_at = time.monotonic()
+            stopped = store.cancel_from_gui(request_id)
+            waiter.join(timeout=2)
+            self.assertFalse(waiter.is_alive())
+            self.assertLess(time.monotonic() - stopped_at, 2)
+            self.assertEqual(stopped["state"], "cancelled")
+            self.assertEqual(stopped["receipt"]["human_action"], "stopped_waiting_once")
+            self.assertEqual(stopped["result"]["decision"], "cancelled")
+            self.assertEqual(stopped["result"]["reason_code"], "stopped_by_user")
+            self.assertNotIn("reply_text", stopped["result"])
+            self.assertEqual(result["snapshot"], stopped)
+            with self.assertRaises(RelayError):
+                store.cancel_from_gui(request_id)
+        finally:
+            if waiter.is_alive():
+                store.shutdown()
+                waiter.join(timeout=2)
+
     def test_restart_gate_is_atomic_and_thread_binding_stays_weak(self) -> None:
         store = RequestStore(elevated=False)
         submitted, _replay, _claim_token = store.submit(
@@ -512,7 +590,7 @@ class StoreTests(unittest.TestCase):
             "idempotency_key": "test-store-0002",
         }
         _submitted, _replay, first_claim = store.submit("consent", base, CLIENT_A)
-        store.update_poll_policy(
+        fixed_policy = store.update_poll_policy(
             {
                 "sound_enabled": True,
                 "poll_wait_seconds": 10,
@@ -520,10 +598,12 @@ class StoreTests(unittest.TestCase):
                 "command_timeout_seconds": 600,
             }
         )
+        self.assertEqual(fixed_policy["wait_seconds"], 900)
+        self.assertEqual(fixed_policy["max_pending_polls"], 10)
         replayed, replay, replay_claim = store.submit("consent", base, CLIENT_A)
         self.assertTrue(replay)
         self.assertEqual(replay_claim, first_claim)
-        self.assertEqual(replayed["poll_policy"]["wait_seconds"], 50)
+        self.assertEqual(replayed["poll_policy"]["wait_seconds"], 900)
         changed = dict(base)
         changed["exact_action"] = "Action B"
         with self.assertRaises(RelayError) as raised:
@@ -599,7 +679,7 @@ class StoreTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertLessEqual(len(first), 132)
 
-    def test_window_policy_is_frozen_and_pending_poll_limit_expires(self) -> None:
+    def test_fixed_policy_is_frozen_and_pending_poll_limit_expires(self) -> None:
         store = RequestStore(
             elevated=False,
             settings={
@@ -621,28 +701,30 @@ class StoreTests(unittest.TestCase):
             },
             CLIENT_A,
         )
-        self.assertEqual(submitted["poll_policy"]["wait_seconds"], 10)
-        self.assertEqual(submitted["poll_policy"]["max_pending_polls"], 3)
-        self.assertEqual(submitted["poll_policy"]["pending_wait_budget_seconds"], 30)
-        self.assertEqual(submitted["poll_policy"]["command_timeout_seconds"], 30)
+        self.assertEqual(submitted["poll_policy"]["wait_seconds"], 900)
+        self.assertEqual(submitted["poll_policy"]["max_pending_polls"], 10)
+        self.assertEqual(submitted["poll_policy"]["pending_wait_budget_seconds"], 9_000)
+        self.assertEqual(submitted["poll_policy"]["command_timeout_seconds"], 9_000)
         request_id = submitted["request_id"]
         with store._condition:
-            store._records[request_id].pending_polls_used = 3
+            store._records[request_id].pending_polls_used = 10
         snapshot = store.wait(request_id, claim_token, 1)
         self.assertEqual(snapshot["state"], "expired")
-        self.assertEqual(snapshot["poll_policy"]["pending_polls_used"], 3)
+        self.assertEqual(snapshot["poll_policy"]["pending_polls_used"], 10)
 
-    def test_minimum_poll_and_single_cycle_form_a_valid_ten_second_budget(self) -> None:
+    def test_legacy_policy_inputs_are_ignored_in_favor_of_fixed_policy(self) -> None:
         policy = normalize_poll_policy(
             {
                 "poll_wait_seconds": 10,
                 "max_pending_polls": 1,
             }
         )
-        self.assertEqual(policy["pending_wait_budget_seconds"], 10)
-        self.assertEqual(policy["command_timeout_seconds"], 10)
+        self.assertEqual(policy["wait_seconds"], 900)
+        self.assertEqual(policy["max_pending_polls"], 10)
+        self.assertEqual(policy["pending_wait_budget_seconds"], 9_000)
+        self.assertEqual(policy["command_timeout_seconds"], 9_000)
 
-    def test_window_policy_replaces_legacy_one_hour_defaults(self) -> None:
+    def test_fixed_policy_sets_pending_and_command_caps(self) -> None:
         store = RequestStore(
             elevated=False,
             settings={
@@ -665,7 +747,7 @@ class StoreTests(unittest.TestCase):
             CLIENT_A,
         )
         detail = store.detail_for_gui(submitted["request_id"])
-        self.assertEqual(detail["frozen"]["expires_in_seconds"], 5_000)
+        self.assertEqual(detail["frozen"]["expires_in_seconds"], 9_000)
         with tempfile.TemporaryDirectory() as temporary_directory:
             command, _replay, _claim_token = store.submit(
                 "command",
@@ -682,7 +764,7 @@ class StoreTests(unittest.TestCase):
                 CLIENT_A,
             )
             command_detail = store.detail_for_gui(command["request_id"])
-            self.assertEqual(command_detail["frozen"]["timeout_seconds"], 5_000)
+            self.assertEqual(command_detail["frozen"]["timeout_seconds"], 9_000)
 
     def test_graceful_window_shutdown_marks_pending_request_with_reason(self) -> None:
         store = RequestStore(elevated=False)
@@ -718,11 +800,269 @@ class StoreTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "broker_stopping")
 
+    def test_gui_snapshot_is_revisioned_and_caps_only_terminal_history(self) -> None:
+        store = RequestStore(elevated=False)
+        active, _replay, _claim = store.submit(
+            "consent",
+            {
+                "exact_action": "Keep the oldest request active.",
+                "target": "bounded GUI history",
+                "risk": "No external effect.",
+                "recovery": "Reject the request.",
+                "idempotency_key": "test-gui-cache-active",
+            },
+            CLIENT_A,
+        )
+        first_revision, first_rows, pending, running = store.gui_snapshot()
+        self.assertIsNotNone(first_rows)
+        self.assertEqual((pending, running), (1, 0))
+        same_revision, unchanged_rows, pending, running = store.gui_snapshot(first_revision)
+        self.assertEqual(same_revision, first_revision)
+        self.assertIsNone(unchanged_rows)
+        self.assertEqual((pending, running), (1, 0))
+
+        for index in range(GUI_TERMINAL_HISTORY_LIMIT + 5):
+            submitted, _replay, _claim = store.submit(
+                "consent",
+                {
+                    "exact_action": f"Reject terminal request {index}.",
+                    "target": "bounded GUI history",
+                    "risk": "No external effect.",
+                    "recovery": "No recovery required.",
+                    "idempotency_key": f"test-gui-cache-terminal-{index:04d}",
+                },
+                CLIENT_A,
+            )
+            store.reject_from_gui(str(submitted["request_id"]))
+
+        final_revision, final_rows, pending, running = store.gui_snapshot(first_revision)
+        assert final_rows is not None
+        terminal_rows = [
+            row for row in final_rows if row["state"] not in {"pending", "running"}
+        ]
+        self.assertGreater(final_revision, first_revision)
+        self.assertEqual(len(terminal_rows), GUI_TERMINAL_HISTORY_LIMIT)
+        self.assertEqual(len(final_rows), GUI_TERMINAL_HISTORY_LIMIT + 1)
+        self.assertIn(active["request_id"], {row["request_id"] for row in final_rows})
+        self.assertEqual((pending, running), (1, 0))
+
 
 class AppearanceTests(unittest.TestCase):
     def test_window_baseline_keeps_fixed_chrome_visible(self) -> None:
         self.assertGreaterEqual(WINDOW_MIN_WIDTH, 920)
         self.assertGreaterEqual(WINDOW_MIN_HEIGHT, 600)
+        self.assertLessEqual(WINDOW_SNAP_MIN_WIDTH, 640)
+
+    def test_responsive_layout_preserves_two_operable_lanes_at_snap_width(self) -> None:
+        compact = responsive_window_layout(WINDOW_SNAP_MIN_WIDTH)
+        comfortable = responsive_window_layout(WINDOW_MIN_WIDTH)
+        self.assertTrue(compact["compact"])
+        self.assertFalse(comfortable["compact"])
+        self.assertEqual(compact["detail_columnspan"], 2)
+        self.assertGreaterEqual(compact["left_minsize"], 280)
+        self.assertGreaterEqual(compact["decision_minsize"], 260)
+        self.assertFalse(compact["show_wait_policy"])
+        self.assertTrue(comfortable["show_wait_policy"])
+
+    def test_status_copy_distinguishes_ready_waiting_and_inventory_failures(self) -> None:
+        self.assertEqual(
+            relay_connection_summary(server_open=True, connector_seen=False)[1],
+            "● 本地中继就绪 · 等待 Codex",
+        )
+        self.assertIn(
+            "最近已连接 Codex",
+            relay_connection_summary(server_open=True, connector_seen=True)[1],
+        )
+        self.assertIn(
+            "不可用",
+            relay_connection_summary(server_open=False, connector_seen=False)[1],
+        )
+        filtered = empty_state_copy(
+            task_filter="active",
+            has_hidden_items=True,
+            inventory_available=True,
+            inventory_error_code=None,
+        )
+        unavailable = empty_state_copy(
+            task_filter="active",
+            has_hidden_items=False,
+            inventory_available=False,
+            inventory_error_code="probe_failed",
+        )
+        self.assertIn("全部", filtered[1])
+        self.assertIn("不可用", unavailable[0])
+
+    @unittest.skipUnless(os.name == "nt", "Native button semantics are Windows-only")
+    def test_circular_decision_control_exposes_native_button_semantics(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            invocations: list[str] = []
+            button = CircularButton(
+                root,
+                text="同意\n本次",
+                command=lambda: invocations.append("approved"),
+                variant="primary",
+                diameter=120,
+            )
+            root.update_idletasks()
+            hwnd = button.winfo_id()
+            class_buffer = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+            name_buffer = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetWindowTextW(hwnd, name_buffer, len(name_buffer))
+            self.assertEqual(class_buffer.value, "Button")
+            self.assertEqual(name_buffer.value, "同意 本次")
+            self.assertTrue(ctypes.windll.user32.IsWindowEnabled(hwnd))
+            self.assertTrue(button._native_subclass_installed)
+            button._native_invoke_pending = True
+            button._drain_native_invoke()
+            self.assertEqual(invocations, ["approved"])
+            button.set_state(tk.DISABLED)
+            self.assertFalse(ctypes.windll.user32.IsWindowEnabled(hwnd))
+            button._native_invoke_pending = True
+            button._drain_native_invoke()
+            self.assertEqual(invocations, ["approved"])
+            owner = button.winfo_toplevel()
+            existing_job = getattr(owner, "_golden_finger_native_drain_job", None)
+            if existing_job is not None:
+                owner.after_cancel(existing_job)
+                setattr(owner, "_golden_finger_native_drain_job", None)
+            CircularButton._drain_native_invoke_group(owner)
+            idle_job = getattr(owner, "_golden_finger_native_drain_job", None)
+            self.assertIsNotNone(idle_job)
+            button.set_state(tk.NORMAL)
+            active_job = getattr(owner, "_golden_finger_native_drain_job", None)
+            self.assertIsNotNone(active_job)
+            self.assertNotEqual(active_job, idle_job)
+        finally:
+            root.destroy()
+
+    def test_circular_button_has_antialiased_edges_and_three_interaction_states(self) -> None:
+        self.assertEqual(antialiased_circle_coverage(10.0, 10.0), 0.5)
+        self.assertEqual(antialiased_circle_coverage(9.0, 10.0), 1.0)
+        self.assertEqual(antialiased_circle_coverage(11.0, 10.0), 0.0)
+        self.assertEqual(
+            circular_button_visual_state(enabled=True, hovered=False, pressed=False),
+            "default",
+        )
+        self.assertEqual(
+            circular_button_visual_state(enabled=True, hovered=True, pressed=False),
+            "hover",
+        )
+        self.assertEqual(
+            circular_button_visual_state(enabled=True, hovered=True, pressed=True),
+            "pressed",
+        )
+        self.assertEqual(
+            circular_button_visual_state(enabled=False, hovered=True, pressed=True),
+            "disabled",
+        )
+
+    def test_decision_canvases_never_overlap_at_supported_widths(self) -> None:
+        for width, height in (
+            (250, 96),
+            (250, 110),
+            (250, 250),
+            (310, 250),
+            (420, 320),
+            (700, 420),
+        ):
+            layout = decision_button_layout(width, height)
+            stop_x, stop_y, stop_size = layout["stop"]
+            approve_x, approve_y, approve_size = layout["approve"]
+            reject_x, reject_y, reject_size = layout["reject"]
+            self.assertLessEqual(stop_x + stop_size, approve_x)
+            self.assertLessEqual(approve_x + approve_size, reject_x)
+            for x, y, size in layout.values():
+                self.assertGreaterEqual(x, 0)
+                self.assertGreaterEqual(y, 0)
+                self.assertLessEqual(x + size, width)
+                self.assertLessEqual(y + size, height)
+            if height >= 110:
+                self.assertGreaterEqual(stop_size, 40)
+                self.assertGreaterEqual(reject_size, 40)
+            self.assertLessEqual(approve_y + approve_size, height - 8)
+        self.assertEqual(
+            decision_button_layout(310, 250)["approve"][2],
+            decision_button_layout(313, 250)["approve"][2],
+        )
+
+    def test_tree_titles_use_width_aware_ellipsis_for_mixed_text(self) -> None:
+        title = "在当前项目中执行一次受限的 Windows 发布前验证"
+        compact = ellipsize_display_text(title, max_units=12)
+        comfortable = ellipsize_display_text(title, max_units=30)
+        self.assertTrue(compact.endswith("…"))
+        self.assertTrue(comfortable.endswith("…"))
+        self.assertLess(len(compact), len(comfortable))
+        self.assertEqual(ellipsize_display_text("批准", max_units=12), "批准")
+
+    def test_decision_and_selection_tokens_meet_contrast_floors(self) -> None:
+        for palette in THEME_PALETTES.values():
+            for background in (
+                palette.accent,
+                palette.accent_hover,
+                palette.accent_pressed,
+            ):
+                self.assertGreaterEqual(
+                    contrast_ratio(background, palette.accent_text),
+                    4.5,
+                )
+            for background in (
+                palette.danger,
+                palette.danger_hover,
+                palette.danger_pressed,
+            ):
+                self.assertGreaterEqual(contrast_ratio(background, "#FFFFFF"), 4.5)
+            self.assertGreaterEqual(contrast_ratio(palette.accent, palette.surface), 4.5)
+            self.assertGreaterEqual(contrast_ratio(palette.selection, palette.surface), 3.0)
+            self.assertGreaterEqual(
+                contrast_ratio(palette.selection, palette.selection_text),
+                4.5,
+            )
+
+    def test_tree_selection_handler_does_not_self_trigger(self) -> None:
+        class FakeTree:
+            def __init__(self) -> None:
+                self.selected = ("request:gfr_new",)
+                self.focused = "request:gfr_new"
+                self.selection_set_calls = 0
+                self.see_calls = 0
+
+            @staticmethod
+            def exists(_item_id: str) -> bool:
+                return True
+
+            def selection(self) -> tuple[str, ...]:
+                return self.selected
+
+            def selection_set(self, item_id: str) -> None:
+                self.selection_set_calls += 1
+                self.selected = (item_id,)
+
+            def focus(self, item_id: str | None = None) -> str:
+                if item_id is not None:
+                    self.focused = item_id
+                return self.focused
+
+            def see(self, _item_id: str) -> None:
+                self.see_calls += 1
+
+        tree = FakeTree()
+        window = object.__new__(RelayWindow)
+        window.tree = tree
+        window.current_item_id = "request:gfr_old"
+        window.current_request_id = "gfr_old"
+        rendered: list[str] = []
+        window._render_detail = rendered.append  # type: ignore[method-assign]
+
+        window.on_select(None)  # type: ignore[arg-type]
+        window.on_select(None)  # type: ignore[arg-type]
+
+        self.assertEqual(tree.selection_set_calls, 0)
+        self.assertEqual(tree.see_calls, 1)
+        self.assertEqual(rendered, ["gfr_new"])
+        self.assertEqual(window.current_item_id, "request:gfr_new")
 
     def test_request_detail_keeps_privilege_disclosure_without_a_banner(self) -> None:
         self.assertEqual(
@@ -777,7 +1117,7 @@ class AppearanceTests(unittest.TestCase):
             )
         )
 
-    def test_ui_preferences_roundtrip_is_bounded(self) -> None:
+    def test_ui_preferences_persist_only_sound_and_ignore_legacy_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             settings_path = Path(temporary_directory) / "ui-settings.json"
             save_ui_settings(
@@ -793,10 +1133,14 @@ class AppearanceTests(unittest.TestCase):
                 load_ui_settings(settings_path),
                 {
                     "sound_enabled": False,
-                    "poll_wait_seconds": 10,
-                    "max_pending_polls": 12,
-                    "command_timeout_seconds": 120,
+                    "poll_wait_seconds": 900,
+                    "max_pending_polls": 10,
+                    "command_timeout_seconds": 9_000,
                 },
+            )
+            self.assertEqual(
+                json.loads(settings_path.read_text(encoding="utf-8")),
+                {"sound_enabled": False},
             )
 
     def test_install_diagnostics_are_sanitized_and_detect_exact_cache(self) -> None:
@@ -905,6 +1249,12 @@ class MCPShapeTests(unittest.TestCase):
             self.assertIn("claim_token", schema["required"])
             self.assertIn("claim_token", schema["properties"])
             self.assertNotIn("client_instance_id", schema["properties"])
+        self.assertEqual(
+            tools_by_name["wait_for_authorization"]["inputSchema"]["properties"][
+                "wait_seconds"
+            ]["enum"],
+            [0, 900],
+        )
 
     def test_new_request_schemas_require_cross_project_source_evidence(self) -> None:
         tools_by_name = {tool["name"]: tool for tool in TOOLS}
@@ -1214,7 +1564,7 @@ class MCPShapeTests(unittest.TestCase):
             fallback["next_arguments"]["wait_seconds"],
             DEFAULT_POLL_WAIT_SECONDS,
         )
-        self.assertEqual(DEFAULT_PENDING_POLL_CYCLES, 72)
+        self.assertEqual(DEFAULT_PENDING_POLL_CYCLES, 10)
 
         terminal = _polling_directive(
             {"request_id": "gfr_TestRequest", "state": "completed"},
@@ -1293,10 +1643,14 @@ class MCPShapeTests(unittest.TestCase):
         self.assertEqual(response["result"]["protocolVersion"], "2025-06-18")
         self.assertEqual(response["result"]["capabilities"], {"tools": {"listChanged": False}})
         self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.0")
-        self.assertEqual(PROTOCOL_VERSION, 4)
+        self.assertEqual(PROTOCOL_VERSION, 5)
 
 
 class ReleasePackagingTests(unittest.TestCase):
+    def test_release_build_pins_the_antialiased_renderer(self) -> None:
+        requirements = (PLUGIN_ROOT / "requirements-build.txt").read_text(encoding="utf-8")
+        self.assertIn("pillow==12.3.0", requirements.casefold())
+
     def test_python_bytecode_is_excluded_from_release_trees(self) -> None:
         self.assertEqual(
             ignore_python_cache(
@@ -1305,6 +1659,22 @@ class ReleasePackagingTests(unittest.TestCase):
             ),
             {"__pycache__", "relay_broker.pyc", "legacy.pyo"},
         )
+
+    def test_release_uses_one_shared_onedir_runtime(self) -> None:
+        builder = (PLUGIN_ROOT / "scripts" / "build_windows_release.py").read_text(
+            encoding="utf-8"
+        )
+        verifier = (PLUGIN_ROOT / "scripts" / "verify_windows_release.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("COLLECT(", builder)
+        self.assertIn('"PIL.AvifImagePlugin"', builder)
+        self.assertIn('"PIL.WebPImagePlugin"', builder)
+        self.assertIn('"golden-finger.runtime"', builder)
+        self.assertIn('"pyinstaller-shared-onedir"', builder)
+        self.assertNotIn('"--onefile"', builder)
+        self.assertIn('"golden-finger.runtime"', verifier)
+        self.assertIn('"pyinstaller-shared-onedir"', verifier)
 
 
 if __name__ == "__main__":

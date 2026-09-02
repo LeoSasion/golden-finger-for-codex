@@ -45,8 +45,9 @@ The MCP-facing process has no approve operation. Approval exists only as a GUI e
 - Command output is returned to the current Codex context and may be retained there even though the broker itself keeps no persistent history.
 - The broker is pull-only. It cannot wake a Codex turn that ended before the connector retrieved a terminal result.
 - The connector cannot monitor window liveness in the background. It can detect unavailability only when an active Codex turn calls health, submits, or waits.
-- MCP cancellation is delayed by the connector's synchronous bounded wait. Once the notification is read, cancellation is best effort and applies only while the card remains pending.
-- Valid window polling changes are automatically saved and apply only to later requests. Every existing request retains the exact policy revision, wait duration, pending-poll budget, and command timeout derived and shown at creation.
+- MCP cancellation can be delayed by the connector's synchronous 900-second wait. Once the notification is read, cancellation is best effort and applies only while the card remains pending.
+- The window's **停止** control is distinct from MCP cancellation: it immediately changes only a pending card to `cancelled`, notifies the Broker wait condition, and expresses neither approval nor rejection. It never terminates an approved or running command.
+- Polling is fixed at 900 seconds × 10 pending polls. Legacy saved poll values are ignored, and every request retains the exact frozen policy revision, pending budget, and command timeout shown at creation.
 - The broker cannot observe commands or output from an independently launched terminal, test supervisor, listener, or other service. This observation limit does not prohibit an otherwise allowed bounded supervisor from being the exact command the broker starts.
 - Job Object termination does not reverse filesystem, network, registry, or other side effects already performed. If the MCP result is interrupted, Codex must still treat the external outcome as uncertain and must not replay it automatically.
 - Task titles, paths, kinds, and status fields returned by Codex are untrusted display data. Sanitization and schema checks reduce accidental misuse but do not turn them into authorization evidence.

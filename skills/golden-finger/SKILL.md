@@ -85,7 +85,7 @@ Use \`request_command_execution\` only when the window should execute a local pr
 
 Never use `request_command_execution` with `codex.exe`, `codex app-server`, or another command that launches or controls Codex. Use `request_consent` only for the human-decision step when that step is otherwise permitted; perform any later authorized action through its proper execution surface.
 
-The relay window owns the polling defaults for new requests. Its two inputs default to a 50-second poll and 72 pending polls; their product is the 3,600-second pending validity and command-execution cap. Valid changes from 10–50 seconds and 1–720 polls are derived, applied, and saved automatically, subject to the total budget bounds. The broker freezes that policy into each request and caps any caller-supplied approval expiry or command timeout; never treat a single MCP poll as the request expiry or override the frozen policy with a second Codex-side configuration.
+The relay uses one fixed policy: a 900-second positive wait, at most 10 pending polls, and their 9,000-second product as both pending validity and command-execution cap. The window has no mutable polling inputs and ignores legacy saved poll values. The broker freezes this policy into each request and caps any shorter caller-supplied approval expiry or command timeout; never treat one MCP poll as the request expiry or override the frozen policy with a second Codex-side configuration.
 
 PowerShell is just one possible executable. Python does not bypass authorization: invoking \`python.exe\` still requires the same exact one-time approval.
 
@@ -99,6 +99,8 @@ The broker is pull-only and cannot wake a Codex turn after that turn ends. Every
 - \`completed\`: for commands, inspect exit code, stdout, stderr, and truncation flags before continuing.
 - \`rejected\`, \`cancelled\`, \`expired\`, \`failed\`, or \`timed_out\`: stop the authorized action and report the terminal result.
 - \`pending\` or \`running\`: this is not a stopping point. Keep the current turn open and immediately call the exact `polling.next_tool` with the exact `polling.next_arguments`. Those arguments include `request_id`, `claim_token`, and `wait_seconds`; preserve all three byte-for-byte and re-read them after every response rather than reconstructing a token or reusing a hard-coded wait. Pending requests expire when their frozen time or poll-count budget is exhausted; running commands continue under their separately frozen execution timeout.
+
+The connector reads Desktop cancellation notifications synchronously, so Desktop **Stop** can remain delayed until the active 900-second broker wait returns. If the user wants to end that wait immediately, direct them to the relay window's small **停止** control. It transitions only a still-pending request to `cancelled`, wakes the active broker wait, and means neither approval nor rejection. It does not cancel an approved or running command.
 
 Never return a final answer or ask the user to send “已完成” while the state is \`pending\` or \`running\`. Do not ask for another confirmation merely because one bounded poll returned active. Do not submit a duplicate with a new key. Never omit, guess, log for convenience, or transfer the claim token; if it is unavailable, fail closed instead of trying another task's request ID. Do not edit or reinterpret `poll_policy`, `pending_polls_remaining`, or `policy_revision`; they are broker-owned synchronization data. Send concise progress commentary about once per minute while continuing the same request.
 

@@ -39,6 +39,13 @@ def main() -> int:
     broker = package / "bin" / "GoldenFinger.exe"
     if not executable.is_file() or not broker.is_file():
         raise RuntimeError("Self-contained executables are missing.")
+    if manifest.get("layout") != "pyinstaller-shared-onedir":
+        raise RuntimeError("Release manifest does not declare the shared PyInstaller onedir layout.")
+    runtime_directory = package / "bin" / "golden-finger.runtime"
+    if not runtime_directory.is_dir() or not any(
+        path.is_file() for path in runtime_directory.rglob("*")
+    ):
+        raise RuntimeError(f"Shared onedir runtime is missing or empty: {runtime_directory.name}")
 
     initialize = {
         "jsonrpc": "2.0",
@@ -82,6 +89,7 @@ def main() -> int:
                 "ok": True,
                 "version": manifest["version"],
                 "build_id": manifest["build_id"],
+                "layout": manifest["layout"],
                 "mcp_server": server_info,
                 "broker_self_test": broker_probe,
             },

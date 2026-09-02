@@ -7,6 +7,7 @@ connector. Approval transitions are reachable only from GUI callbacks.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -14,11 +15,13 @@ import ctypes
 from ctypes import wintypes
 import json
 import locale
+import math
 import os
 from pathlib import Path
 import secrets
 import socket
 import socketserver
+import struct
 import subprocess
 import sys
 import tempfile
@@ -26,9 +29,16 @@ import threading
 import time
 import tomllib
 from typing import Any, BinaryIO, Callable
+import unicodedata
+import zlib
 
 import tkinter as tk
 from tkinter import messagebox, ttk
+
+try:
+    from PIL import Image, ImageDraw, ImageFilter, ImageTk
+except ImportError:  # Source-mode fallback; release builds always include Pillow.
+    Image = ImageDraw = ImageFilter = ImageTk = None  # type: ignore[assignment]
 
 from codex_lifecycle import (
     CodexTask,
@@ -41,15 +51,9 @@ from codex_lifecycle import (
 from relay_protocol import (
     DEFAULT_PENDING_POLL_CYCLES,
     DEFAULT_POLL_WAIT_SECONDS,
-    MAX_APPROVAL_EXPIRY_SECONDS,
     MAX_OUTPUT_BYTES,
-    MAX_PENDING_POLL_CYCLES,
     MAX_PENDING_REQUESTS,
-    MAX_POLL_WAIT_SECONDS,
     MAX_WIRE_BYTES,
-    MIN_APPROVAL_EXPIRY_SECONDS,
-    MIN_PENDING_POLL_CYCLES,
-    MIN_POLL_WAIT_SECONDS,
     PACKAGE_VERSION,
     PROTOCOL_VERSION,
     REQUEST_ID_PREFIX,
@@ -74,19 +78,24 @@ from relay_protocol import (
 BROKER_VERSION = PACKAGE_VERSION
 BROKER_BUILD_ID = RUNTIME_BUILD_ID
 TERMINAL_RETENTION_SECONDS = 3_600
+GUI_TERMINAL_HISTORY_LIMIT = 200
 WINDOW_BACKGROUND_OPACITY = 0.60
 WINDOW_CONTENT_OPACITY = 1.0
 WINDOW_TRANSPARENT_COLOR = "#010203"
 WINDOW_HIT_SHIELD_OPACITY = 0.01
 WINDOW_DEFAULT_WIDTH = 980
 WINDOW_DEFAULT_HEIGHT = 720
+# The incumbent two-column composition is most comfortable at this width, but
+# the actual resize floor is lower so a DPI-aware window still fits Windows Snap.
 WINDOW_MIN_WIDTH = 920
+WINDOW_SNAP_MIN_WIDTH = 640
+WINDOW_COMPACT_BREAKPOINT = 820
 WINDOW_MIN_HEIGHT = 600
 WINDOW_MIN_CONTENT_HEIGHT = 260
-WINDOW_DETAIL_WIDTH = 470
-WINDOW_EXPANDED_MIN_WIDTH = 1_340
+WINDOW_TOUCH_TARGET = 40
 THEME_REFRESH_SECONDS = 2.0
-POLICY_APPLY_DEBOUNCE_MS = 250
+DECISION_LAYOUT_DEBOUNCE_MS = 80
+RESPONSIVE_LAYOUT_DEBOUNCE_MS = 80
 UI_SETTINGS_FILENAME = "ui-settings.json"
 ACTIVE_STATES = {"pending", "running"}
 TERMINAL_STATES = {
@@ -114,6 +123,7 @@ class ThemePalette:
     accent_pressed: str
     accent_text: str
     selection: str
+    selection_text: str
     code_background: str
     success_text: str
     danger_text: str
@@ -135,16 +145,17 @@ THEME_PALETTES = {
         text="#0D0D0D",
         muted="#62666D",
         border="#D9DCE0",
-        accent="#0285FF",
-        accent_hover="#0076E4",
-        accent_pressed="#0068C8",
+        accent="#006FD6",
+        accent_hover="#0062C0",
+        accent_pressed="#0056A8",
         accent_text="#FFFFFF",
-        selection="#D9ECFF",
+        selection="#006FD6",
+        selection_text="#FFFFFF",
         code_background="#F4F5F6",
         success_text="#205C2F",
         danger_text="#8F1D1D",
         danger="#D92D20",
-        danger_hover="#E5483C",
+        danger_hover="#C8271C",
         danger_pressed="#B42318",
         shadow="#C7CBD1",
         disabled_background="#E5E7EA",
@@ -162,20 +173,336 @@ THEME_PALETTES = {
         accent="#339CFF",
         accent_hover="#57ADFF",
         accent_pressed="#2088ED",
-        accent_text="#FFFFFF",
-        selection="#163B59",
+        accent_text="#0D0D0D",
+        selection="#1F6FA8",
+        selection_text="#FFFFFF",
         code_background="#111111",
         success_text="#A8E4B8",
         danger_text="#FFB8B8",
-        danger="#E5484D",
-        danger_hover="#F05D61",
-        danger_pressed="#C93C41",
+        danger="#C9343A",
+        danger_hover="#B82D33",
+        danger_pressed="#A5252B",
         shadow="#0E0E0E",
         disabled_background="#303030",
         disabled_text="#777777",
         secondary_hover="#343434",
     ),
 }
+
+
+def antialiased_circle_coverage(distance: float, radius: float) -> float:
+    """Return one-pixel edge coverage for a software-rasterized circle."""
+
+    return max(0.0, min(1.0, radius + 0.5 - distance))
+
+
+def circular_button_visual_state(
+    *,
+    enabled: bool,
+    hovered: bool,
+    pressed: bool,
+) -> str:
+    """Resolve a single explicit visual state for the decision controls."""
+
+    if not enabled:
+        return "disabled"
+    if pressed:
+        return "pressed"
+    if hovered:
+        return "hover"
+    return "default"
+
+
+def decision_button_layout(
+    width: int,
+    height: int,
+) -> dict[str, tuple[int, int, int]]:
+    """Lay out the three circular decisions without overlapping their canvases."""
+
+    bounded_width = max(1, int(width))
+    bounded_height = max(1, int(height))
+    # Reserve breathing room above the status rows. At the 600 px Snap floor
+    # the descriptive copy can leave this stage much shorter than its requested
+    # 250 px; height must therefore be a real constraint, not merely a hint.
+    usable_height = max(1, bounded_height - 16)
+    minimum_approve_size = min(138, usable_height)
+    raw_approve_size = max(
+        minimum_approve_size,
+        min(188, int(min(bounded_width * 0.58, usable_height))),
+    )
+    approve_size = max(
+        1,
+        min(186, usable_height, max(1, round(raw_approve_size / 6) * 6)),
+    )
+    auxiliary_floor = min(WINDOW_TOUCH_TARGET, usable_height)
+    auxiliary_size = max(
+        auxiliary_floor,
+        min(58, usable_height, round(approve_size * 0.31)),
+    )
+    auxiliary_size = max(
+        auxiliary_floor,
+        min(58, usable_height, round(auxiliary_size / 2) * 2),
+    )
+    gap = max(8, round(auxiliary_size * 0.14))
+    width_limited_approve = bounded_width - 2 * (auxiliary_size + gap)
+    if width_limited_approve >= minimum_approve_size:
+        approve_size = min(approve_size, width_limited_approve)
+        approve_size = max(
+            1,
+            min(usable_height, max(1, approve_size // 6 * 6)),
+        )
+        auxiliary_size = max(
+            auxiliary_floor,
+            min(58, usable_height, round(approve_size * 0.31)),
+        )
+        auxiliary_size = max(
+            auxiliary_floor,
+            min(58, usable_height, round(auxiliary_size / 2) * 2),
+        )
+        gap = max(8, round(auxiliary_size * 0.14))
+
+    approve_x = max(0, (bounded_width - approve_size) // 2)
+    approve_y = max(4, (bounded_height - approve_size) // 2)
+    auxiliary_y = max(
+        0,
+        min(
+            max(0, bounded_height - auxiliary_size),
+            approve_y + max(4, round(auxiliary_size * 0.10)),
+        ),
+    )
+    stop_x = max(0, approve_x - auxiliary_size - gap)
+    reject_x = min(
+        max(0, bounded_width - auxiliary_size),
+        approve_x + approve_size + gap,
+    )
+    return {
+        "stop": (stop_x, auxiliary_y, auxiliary_size),
+        "approve": (approve_x, approve_y, approve_size),
+        "reject": (reject_x, auxiliary_y, auxiliary_size),
+    }
+
+
+def responsive_window_layout(width: int) -> dict[str, Any]:
+    """Return a deterministic Snap-safe layout without querying Tk state."""
+
+    bounded_width = max(WINDOW_SNAP_MIN_WIDTH, int(width))
+    compact = bounded_width < WINDOW_COMPACT_BREAKPOINT
+    return {
+        "compact": compact,
+        "left_weight": 1 if compact else 4,
+        "decision_weight": 1 if compact else 3,
+        # At the 640 px Snap floor these two panes still leave 250 px inside
+        # the decision card, enough for the three non-overlapping circles.
+        "left_minsize": 298 if compact else 340,
+        "decision_minsize": 282 if compact else 310,
+        "tree_title_width": 120 if compact else 210,
+        "tree_state_width": 58 if compact else 68,
+        "tree_source_width": 64 if compact else 92,
+        "show_wait_policy": not compact,
+        # Detail is an in-window overlay, never a third sizing column.
+        "detail_column": 0,
+        "detail_columnspan": 2,
+    }
+
+
+def relay_connection_summary(
+    *,
+    server_open: bool,
+    connector_seen: bool,
+) -> tuple[str, str]:
+    """Return the semantic style and honest local-relay status copy."""
+
+    if not server_open:
+        return (
+            "ConnectionError.HAR.TLabel",
+            "● 本地中继不可用 · 请关闭并重新打开窗口",
+        )
+    if connector_seen:
+        return (
+            "Connection.HAR.TLabel",
+            "● 本地中继就绪 · 最近已连接 Codex",
+        )
+    return (
+        "ConnectionWaiting.HAR.TLabel",
+        "● 本地中继就绪 · 等待 Codex",
+    )
+
+
+def empty_state_copy(
+    *,
+    task_filter: str,
+    has_hidden_items: bool,
+    inventory_available: bool,
+    inventory_error_code: str | None,
+) -> tuple[str, str, str, str]:
+    """Distinguish filter-empty, first-use, and inventory-error states."""
+
+    if not inventory_available and inventory_error_code not in {
+        None,
+        "awaiting_thread_metadata",
+    }:
+        reason = inventory_error_code or "unknown"
+        return (
+            "Codex 任务清单暂不可用",
+            "安全重启已禁用 · 打开“诊断”查看恢复信息",
+            "任务清单不可用",
+            f"任务清单错误: {reason}\n打开右上角“诊断”核对连接、版本与安装状态。",
+        )
+    if task_filter == "active" and has_hidden_items:
+        return (
+            "当前没有进行中的任务或请求",
+            "选择“全部”可查看历史请求与空闲任务",
+            "当前筛选无结果",
+            "当前筛选没有结果。选择“全部”可查看已结束请求与空闲任务。",
+        )
+    if not inventory_available and inventory_error_code == "awaiting_thread_metadata":
+        return (
+            "本地中继已就绪",
+            "等待任一 Codex 任务连接并提交授权请求",
+            "等待 Codex 连接",
+            "尚未观察到 Codex 任务。保持本窗口开启；收到请求时会自动提醒。",
+        )
+    return (
+        "当前没有授权请求",
+        "Codex 提交明确动作后，金手指会在这里提醒你",
+        "暂无待确认请求",
+        "当前没有待确认请求。你可以继续使用 Codex，收到请求时本窗口会自动提醒。",
+    )
+
+
+def ellipsize_display_text(
+    value: object,
+    *,
+    max_units: int,
+    fallback: str = "—",
+) -> str:
+    """Fit mixed Chinese/Latin text to an approximate UI width with an ellipsis."""
+
+    if not isinstance(value, str):
+        return fallback
+    cleaned = " ".join(value.replace("\x00", " ").split())
+    if not cleaned:
+        return fallback
+    budget = max(3, int(max_units))
+
+    def units(character: str) -> int:
+        return 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+
+    if sum(units(character) for character in cleaned) <= budget:
+        return cleaned
+    prefix: list[str] = []
+    consumed = 0
+    content_budget = budget - 2
+    for character in cleaned:
+        character_units = units(character)
+        if consumed + character_units > content_budget:
+            break
+        prefix.append(character)
+        consumed += character_units
+    return "".join(prefix).rstrip() + "…"
+
+
+def _hex_rgb(color: str) -> tuple[int, int, int]:
+    value = color.lstrip("#")
+    if len(value) != 6:
+        raise ValueError(f"Expected #RRGGBB color, got {color!r}")
+    return tuple(int(value[index : index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+
+
+def contrast_ratio(first: str, second: str) -> float:
+    """Return the WCAG contrast ratio for two #RRGGBB colors."""
+
+    def relative_luminance(color: str) -> float:
+        channels = []
+        for channel in _hex_rgb(color):
+            normalized = channel / 255
+            channels.append(
+                normalized / 12.92
+                if normalized <= 0.04045
+                else ((normalized + 0.055) / 1.055) ** 2.4
+            )
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+    first_luminance = relative_luminance(first)
+    second_luminance = relative_luminance(second)
+    lighter = max(first_luminance, second_luminance)
+    darker = min(first_luminance, second_luminance)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _blend_rgb(
+    background: tuple[int, int, int],
+    foreground: tuple[int, int, int],
+    opacity: float,
+) -> tuple[int, int, int]:
+    alpha = max(0.0, min(1.0, opacity))
+    inverse = 1.0 - alpha
+    return tuple(
+        round(background[channel] * inverse + foreground[channel] * alpha)
+        for channel in range(3)
+    )  # type: ignore[return-value]
+
+
+def _paint_antialiased_circle(
+    pixels: bytearray,
+    *,
+    size: int,
+    center_x: float,
+    center_y: float,
+    radius: float,
+    color: tuple[int, int, int],
+    opacity: float = 1.0,
+) -> None:
+    if radius <= 0 or opacity <= 0:
+        return
+    minimum_x = max(0, math.floor(center_x - radius - 1))
+    maximum_x = min(size - 1, math.ceil(center_x + radius + 1))
+    minimum_y = max(0, math.floor(center_y - radius - 1))
+    maximum_y = min(size - 1, math.ceil(center_y + radius + 1))
+    for y in range(minimum_y, maximum_y + 1):
+        pixel_y = y + 0.5
+        row_offset = y * size
+        for x in range(minimum_x, maximum_x + 1):
+            distance = math.hypot(x + 0.5 - center_x, pixel_y - center_y)
+            coverage = antialiased_circle_coverage(distance, radius) * opacity
+            if coverage <= 0:
+                continue
+            index = (row_offset + x) * 3
+            inverse = 1.0 - coverage
+            pixels[index] = round(pixels[index] * inverse + color[0] * coverage)
+            pixels[index + 1] = round(
+                pixels[index + 1] * inverse + color[1] * coverage
+            )
+            pixels[index + 2] = round(
+                pixels[index + 2] * inverse + color[2] * coverage
+            )
+
+
+def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+    checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+    return (
+        struct.pack(">I", len(payload))
+        + chunk_type
+        + payload
+        + struct.pack(">I", checksum)
+    )
+
+
+def _rgb_png(pixels: bytearray, *, size: int) -> bytes:
+    """Encode RGB pixels for Tk without a slow per-pixel Tcl color list."""
+
+    stride = size * 3
+    scanlines = b"".join(
+        b"\x00" + bytes(pixels[offset : offset + stride])
+        for offset in range(0, len(pixels), stride)
+    )
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(scanlines, level=1))
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 def codex_config_path() -> Path:
@@ -255,38 +582,12 @@ def default_ui_settings() -> dict[str, Any]:
     }
 
 
-def normalize_poll_policy(settings: dict[str, Any]) -> dict[str, Any]:
-    poll_wait_seconds = settings.get("poll_wait_seconds")
-    max_pending_polls = settings.get("max_pending_polls")
-    for name, value, minimum, maximum in (
-        (
-            "poll_wait_seconds",
-            poll_wait_seconds,
-            MIN_POLL_WAIT_SECONDS,
-            MAX_POLL_WAIT_SECONDS,
-        ),
-        (
-            "max_pending_polls",
-            max_pending_polls,
-            MIN_PENDING_POLL_CYCLES,
-            MAX_PENDING_POLL_CYCLES,
-        ),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"{name} must be an integer")
-        if not minimum <= value <= maximum:
-            raise ValueError(f"{name} must be between {minimum} and {maximum}")
+def normalize_poll_policy(_settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the single shipped wait policy; legacy UI values are ignored."""
+
+    poll_wait_seconds = DEFAULT_POLL_WAIT_SECONDS
+    max_pending_polls = DEFAULT_PENDING_POLL_CYCLES
     pending_wait_budget_seconds = poll_wait_seconds * max_pending_polls
-    if pending_wait_budget_seconds < MIN_APPROVAL_EXPIRY_SECONDS:
-        raise ValueError(
-            "poll_wait_seconds multiplied by max_pending_polls must be at least "
-            f"{MIN_APPROVAL_EXPIRY_SECONDS} seconds"
-        )
-    if pending_wait_budget_seconds > MAX_APPROVAL_EXPIRY_SECONDS:
-        raise ValueError(
-            "poll_wait_seconds multiplied by max_pending_polls must not exceed "
-            f"{MAX_APPROVAL_EXPIRY_SECONDS} seconds"
-        )
     command_timeout_seconds = pending_wait_budget_seconds
     policy = {
         "wait_seconds": poll_wait_seconds,
@@ -308,29 +609,10 @@ def load_ui_settings(path: Path | None = None) -> dict[str, Any]:
         return settings
     if isinstance(value.get("sound_enabled"), bool):
         settings["sound_enabled"] = value["sound_enabled"]
-    policy_candidate = {
-        key: value.get(key, settings[key])
-        for key in (
-            "poll_wait_seconds",
-            "max_pending_polls",
-        )
-    }
-    try:
-        policy = normalize_poll_policy(policy_candidate)
-    except ValueError:
-        return settings
-    settings.update(
-        {
-            "poll_wait_seconds": policy["wait_seconds"],
-            "max_pending_polls": policy["max_pending_polls"],
-            "command_timeout_seconds": policy["command_timeout_seconds"],
-        }
-    )
     return settings
 
 
 def save_ui_settings(settings: dict[str, Any], path: Path | None = None) -> None:
-    policy = normalize_poll_policy(settings)
     destination = path or ui_settings_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
@@ -344,9 +626,6 @@ def save_ui_settings(settings: dict[str, Any], path: Path | None = None) -> None
             json.dump(
                 {
                     "sound_enabled": bool(settings.get("sound_enabled", True)),
-                    "poll_wait_seconds": policy["wait_seconds"],
-                    "max_pending_polls": policy["max_pending_polls"],
-                    "command_timeout_seconds": policy["command_timeout_seconds"],
                 },
                 handle,
                 ensure_ascii=True,
@@ -558,8 +837,34 @@ def apply_native_window_appearance(
     )
 
 
-class CircularButton(tk.Canvas):
-    """Responsive, keyboard-accessible circular decision control."""
+# UI Automation invokes a native BM_CLICK which is bridged back onto Tk's
+# thread. Poll quickly only while a decision is actionable; dormant windows
+# should not wake dozens of times per second indefinitely.
+BUTTON_NATIVE_ACTIVE_DRAIN_MS = 100
+BUTTON_NATIVE_IDLE_DRAIN_MS = 500
+BUTTON_MESSAGE_CLICK = 0x00F5  # BM_CLICK
+BUTTON_MESSAGE_NCDESTROY = 0x0082  # WM_NCDESTROY
+EVENT_OBJECT_STATECHANGE = 0x800A
+EVENT_OBJECT_NAMECHANGE = 0x800C
+ACCESSIBLE_OBJID_CLIENT = -4
+ACCESSIBLE_CHILDID_SELF = 0
+
+if os.name == "nt":
+    ButtonSubclassProc = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    )
+else:
+    ButtonSubclassProc = None
+
+
+class CircularButton(tk.Button):
+    """Native semantic button with software-antialiased circular artwork."""
 
     def __init__(
         self,
@@ -570,12 +875,22 @@ class CircularButton(tk.Canvas):
         variant: str,
         diameter: int,
     ) -> None:
+        placeholder = tk.PhotoImage(master=parent, width=diameter, height=diameter)
         super().__init__(
             parent,
+            text=text,
+            command=command,
+            image=placeholder,
+            compound=tk.CENTER,
             width=diameter,
             height=diameter,
             borderwidth=0,
             highlightthickness=0,
+            padx=0,
+            pady=0,
+            relief=tk.FLAT,
+            overrelief=tk.FLAT,
+            default=tk.DISABLED,
             takefocus=1,
             cursor="hand2",
         )
@@ -588,7 +903,18 @@ class CircularButton(tk.Canvas):
         self._pressed = False
         self._focused = False
         self._palette = THEME_PALETTES["light"]
+        self._parent_background = self._palette.surface
+        self._button_image: Any = placeholder
+        self._image_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+        self._native_hwnd: int | None = None
+        self._native_subclass_id = 0
+        self._native_subclass_callback: Any = None
+        self._native_subclass_installed = False
+        self._native_invoke_pending = False
+        self._native_drain_owner: tk.Misc | None = None
+        self._destroyed = False
         self.bind("<Enter>", self._on_enter)
+        self.bind("<Motion>", self._on_motion)
         self.bind("<Leave>", self._on_leave)
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
@@ -597,10 +923,22 @@ class CircularButton(tk.Canvas):
         self.bind("<KeyPress-space>", self._on_space_press)
         self.bind("<KeyRelease-space>", self._on_space_release)
         self.bind("<Return>", self._on_return)
+        self.bind("<Destroy>", self._on_destroy, add="+")
+        self._install_native_invoke_bridge()
+        self._redraw()
+        self._schedule_native_invoke_drain()
 
     def apply_theme(self, palette: ThemePalette, *, parent_background: str) -> None:
+        if palette != self._palette or parent_background != self._parent_background:
+            self._image_cache.clear()
         self._palette = palette
-        self.configure(background=parent_background)
+        self._parent_background = parent_background
+        self.configure(
+            background=parent_background,
+            activebackground=parent_background,
+            highlightbackground=parent_background,
+            highlightcolor=parent_background,
+        )
         self._redraw()
 
     def set_state(self, state: str) -> None:
@@ -611,7 +949,13 @@ class CircularButton(tk.Canvas):
         if not enabled:
             self._hovered = False
             self._pressed = False
-        self.configure(takefocus=1 if enabled else 0, cursor="hand2" if enabled else "")
+        self.configure(
+            takefocus=1 if enabled else 0,
+            cursor="hand2" if enabled else "",
+        )
+        self._sync_native_enabled()
+        if enabled:
+            self._accelerate_native_invoke_drain()
         self._redraw()
 
     def set_diameter(self, diameter: int) -> None:
@@ -619,94 +963,543 @@ class CircularButton(tk.Canvas):
         if bounded == self._diameter:
             return
         self._diameter = bounded
+        self._image_cache.clear()
         self.configure(width=bounded, height=bounded)
         self._redraw()
 
-    def _redraw(self) -> None:
-        self.delete("all")
+    def _inside_circle(self, x: float, y: float) -> bool:
+        center = self._diameter / 2
+        radius = max(1.0, center - max(5, round(self._diameter * 0.04)))
+        return math.hypot(x - center, y - center) <= radius
+
+    def _render_pillow_button_image(
+        self,
+        *,
+        size: int,
+        background_rgb: tuple[int, int, int],
+        fill_rgb: tuple[int, int, int],
+        shadow_rgb: tuple[int, int, int],
+        focus_rgb: tuple[int, int, int],
+        outline_rgb: tuple[int, int, int],
+        center_x: float,
+        center_y: float,
+        radius: float,
+        shadow_offset: int,
+        shadow_opacity: float,
+    ) -> Any:
+        if Image is None or ImageDraw is None or ImageFilter is None or ImageTk is None:
+            raise RuntimeError("Pillow renderer requested without Pillow")
+        scale = 3
+        rendered_size = size * scale
+        canvas = Image.new("RGBA", (rendered_size, rendered_size), (*background_rgb, 255))
+
+        def ellipse_box(circle_radius: float, *, y_offset: float = 0.0) -> tuple[float, ...]:
+            return (
+                (center_x - circle_radius) * scale,
+                (center_y + y_offset - circle_radius) * scale,
+                (center_x + circle_radius) * scale,
+                (center_y + y_offset + circle_radius) * scale,
+            )
+
+        if shadow_opacity > 0:
+            shadow_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+            ImageDraw.Draw(shadow_layer).ellipse(
+                ellipse_box(radius + 0.8, y_offset=shadow_offset),
+                fill=(*shadow_rgb, round(255 * shadow_opacity)),
+            )
+            blur_radius = max(1.4, size * 0.012) * scale
+            shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(blur_radius))
+            canvas = Image.alpha_composite(canvas, shadow_layer)
+
+        drawing = ImageDraw.Draw(canvas)
+        if self._focused and self._enabled:
+            drawing.ellipse(
+                ellipse_box(radius + 2.0),
+                fill=(*focus_rgb, 230),
+            )
+        drawing.ellipse(ellipse_box(radius), fill=(*outline_rgb, 255))
+        drawing.ellipse(ellipse_box(radius - 1.25), fill=(*fill_rgb, 255))
+        reduced = canvas.resize((size, size), Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(reduced, master=self)
+
+    def _render_button_image(self, visual_state: str) -> Any:
         size = self._diameter
         palette = self._palette
-        small = self.variant == "danger"
-        if not self._enabled:
-            fill = palette.disabled_background
-            foreground = palette.disabled_text
-        elif small:
-            fill = (
-                palette.danger_pressed
-                if self._pressed
-                else palette.danger_hover
-                if self._hovered
-                else palette.danger
-            )
-            foreground = "#FFFFFF"
-        else:
-            fill = (
-                palette.accent_pressed
-                if self._pressed
-                else palette.accent_hover
-                if self._hovered
-                else palette.accent
-            )
-            foreground = palette.accent_text
+        small = self.variant in {"danger", "neutral"}
+        cache_key = (
+            size,
+            visual_state,
+            self._focused,
+            palette,
+            self._parent_background,
+            self.variant,
+        )
+        cached = self._image_cache.get(cache_key)
+        if cached is not None:
+            self._image_cache.move_to_end(cache_key)
+            return cached
 
-        shift = 2 if self._pressed else 0
-        shadow_offset = max(2, round(size * 0.025))
-        outline_width = 3 if self._focused and self._enabled else 1
-        outline = palette.text if self._focused and self._enabled else (
-            palette.danger_hover if small else palette.accent_hover
+        if visual_state == "disabled":
+            fill = palette.disabled_background
+        elif self.variant == "danger":
+            fill = {
+                "pressed": palette.danger_pressed,
+                "hover": palette.danger_hover,
+            }.get(visual_state, palette.danger)
+        elif self.variant == "neutral":
+            fill = {
+                "pressed": palette.border,
+                "hover": palette.secondary_hover,
+            }.get(visual_state, palette.surface_alt)
+        else:
+            fill = {
+                "pressed": palette.accent_pressed,
+                "hover": palette.accent_hover,
+            }.get(visual_state, palette.accent)
+
+        background_rgb = _hex_rgb(self._parent_background)
+        fill_rgb = _hex_rgb(fill)
+        shadow_rgb = _hex_rgb(palette.shadow)
+        focus_rgb = _hex_rgb(palette.text)
+        outline_source = (
+            palette.danger_hover
+            if self.variant == "danger"
+            else palette.border
+            if self.variant == "neutral"
+            else palette.accent_hover
         )
-        if not self._pressed:
-            self.create_oval(
-                5 + shadow_offset,
-                5 + shadow_offset,
-                size - 5 + shadow_offset,
-                size - 5 + shadow_offset,
-                fill=palette.shadow,
-                outline="",
+        outline_rgb = _blend_rgb(_hex_rgb(outline_source), focus_rgb, 0.18)
+        margin = max(6, round(size * 0.045))
+        radius = max(12.0, size / 2 - margin)
+        center_x = size / 2
+        center_y = size / 2
+        if visual_state == "hover":
+            center_y -= 1
+            radius += 0.5
+            shadow_offset = max(3, round(size * 0.030))
+            shadow_opacity = 0.42
+        elif visual_state == "pressed":
+            center_y += 2
+            radius -= 1
+            shadow_offset = 1
+            shadow_opacity = 0.12
+        elif visual_state == "disabled":
+            shadow_offset = 0
+            shadow_opacity = 0.0
+        else:
+            shadow_offset = max(2, round(size * 0.022))
+            shadow_opacity = 0.30
+
+        if Image is not None and ImageDraw is not None and ImageFilter is not None and ImageTk is not None:
+            image = self._render_pillow_button_image(
+                size=size,
+                background_rgb=background_rgb,
+                fill_rgb=fill_rgb,
+                shadow_rgb=shadow_rgb,
+                focus_rgb=focus_rgb,
+                outline_rgb=outline_rgb,
+                center_x=center_x,
+                center_y=center_y,
+                radius=radius,
+                shadow_offset=shadow_offset,
+                shadow_opacity=shadow_opacity,
             )
-        self.create_oval(
-            4 + shift,
-            4 + shift,
-            size - 7 + shift,
-            size - 7 + shift,
-            fill=fill,
-            outline=outline,
-            width=outline_width,
+        else:
+            pixels = bytearray(background_rgb * (size * size))
+            if shadow_opacity > 0:
+                for spread, opacity_scale in ((2.4, 0.22), (1.2, 0.34), (0.0, 0.44)):
+                    _paint_antialiased_circle(
+                        pixels,
+                        size=size,
+                        center_x=center_x,
+                        center_y=center_y + shadow_offset,
+                        radius=radius + spread,
+                        color=shadow_rgb,
+                        opacity=shadow_opacity * opacity_scale,
+                    )
+
+            if self._focused and self._enabled:
+                _paint_antialiased_circle(
+                    pixels,
+                    size=size,
+                    center_x=center_x,
+                    center_y=center_y,
+                    radius=radius + 2.0,
+                    color=focus_rgb,
+                    opacity=0.90,
+                )
+            _paint_antialiased_circle(
+                pixels,
+                size=size,
+                center_x=center_x,
+                center_y=center_y,
+                radius=radius,
+                color=outline_rgb,
+                opacity=1.0,
+            )
+            _paint_antialiased_circle(
+                pixels,
+                size=size,
+                center_x=center_x,
+                center_y=center_y,
+                radius=radius - 1.25,
+                color=fill_rgb,
+                opacity=1.0,
+            )
+            image = tk.PhotoImage(
+                master=self,
+                data=base64.b64encode(_rgb_png(pixels, size=size)),
+                format="png",
+            )
+        self._image_cache[cache_key] = image
+        self._image_cache.move_to_end(cache_key)
+        while len(self._image_cache) > 8:
+            self._image_cache.popitem(last=False)
+        return image
+
+    def _redraw(self) -> None:
+        size = self._diameter
+        palette = self._palette
+        small = self.variant in {"danger", "neutral"}
+        visual_state = circular_button_visual_state(
+            enabled=self._enabled,
+            hovered=self._hovered,
+            pressed=self._pressed,
         )
+        foreground = (
+            palette.disabled_text
+            if visual_state == "disabled"
+            else "#FFFFFF"
+            if self.variant == "danger"
+            else palette.text
+            if self.variant == "neutral"
+            else palette.accent_text
+        )
+        self._button_image = self._render_button_image(visual_state)
         font_size = max(9, round(size * (0.16 if small else 0.105)))
-        self.create_text(
-            size // 2 + shift,
-            size // 2 + shift,
+        self.configure(
+            image=self._button_image,
             text=self.button_text,
-            fill=foreground,
+            compound=tk.CENTER,
+            foreground=foreground,
+            activeforeground=foreground,
+            disabledforeground=palette.disabled_text,
+            background=self._parent_background,
+            activebackground=self._parent_background,
             justify=tk.CENTER,
             font=("Microsoft YaHei UI", font_size, "bold"),
+            wraplength=max(34, size - 12),
         )
+        self._sync_native_accessible_name()
 
-    def _on_enter(self, _event: tk.Event[Any]) -> None:
-        if self._enabled:
+    def _sync_native_accessible_name(self) -> None:
+        """Expose a stable Win32 Button name even when an image is displayed."""
+
+        if os.name != "nt":
+            return
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = self.winfo_id()
+            accessible_name = " ".join(self.button_text.split())
+            length = max(0, int(user32.GetWindowTextLengthW(ctypes.c_void_p(hwnd))))
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(ctypes.c_void_p(hwnd), buffer, len(buffer))
+            if buffer.value != accessible_name:
+                user32.SetWindowTextW(ctypes.c_void_p(hwnd), accessible_name)
+                user32.NotifyWinEvent(
+                    ctypes.c_uint(EVENT_OBJECT_NAMECHANGE),
+                    ctypes.c_void_p(hwnd),
+                    ctypes.c_long(ACCESSIBLE_OBJID_CLIENT),
+                    ctypes.c_long(ACCESSIBLE_CHILDID_SELF),
+                )
+        except (AttributeError, OSError, TypeError, ValueError, tk.TclError):
+            pass
+
+    def _sync_native_enabled(self) -> None:
+        """Keep the underlying Win32 Button state aligned with the Tk state."""
+
+        if os.name != "nt":
+            return
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = self.winfo_id()
+            native_enabled = bool(user32.IsWindowEnabled(ctypes.c_void_p(hwnd)))
+            if native_enabled == self._enabled:
+                return
+            user32.EnableWindow(
+                ctypes.c_void_p(hwnd),
+                ctypes.c_int(1 if self._enabled else 0),
+            )
+            user32.NotifyWinEvent(
+                ctypes.c_uint(EVENT_OBJECT_STATECHANGE),
+                ctypes.c_void_p(hwnd),
+                ctypes.c_long(ACCESSIBLE_OBJID_CLIENT),
+                ctypes.c_long(ACCESSIBLE_CHILDID_SELF),
+            )
+        except (AttributeError, OSError, TypeError, ValueError, tk.TclError):
+            pass
+
+    def _install_native_invoke_bridge(self) -> None:
+        """Translate UI Automation BM_CLICK into one Tk-thread invocation."""
+
+        if os.name != "nt" or ButtonSubclassProc is None:
+            return
+        try:
+            comctl32 = ctypes.windll.comctl32
+            comctl32.SetWindowSubclass.argtypes = (
+                wintypes.HWND,
+                ButtonSubclassProc,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+            )
+            comctl32.SetWindowSubclass.restype = wintypes.BOOL
+            comctl32.DefSubclassProc.argtypes = (
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+            comctl32.DefSubclassProc.restype = ctypes.c_ssize_t
+            comctl32.RemoveWindowSubclass.argtypes = (
+                wintypes.HWND,
+                ButtonSubclassProc,
+                ctypes.c_size_t,
+            )
+            comctl32.RemoveWindowSubclass.restype = wintypes.BOOL
+
+            hwnd = int(self.winfo_id())
+            subclass_id = ctypes.c_size_t(id(self)).value or 1
+
+            @ButtonSubclassProc
+            def subclass_proc(
+                native_hwnd: int,
+                message: int,
+                wparam: int,
+                lparam: int,
+                _subclass_id: int,
+                _reference_data: int,
+            ) -> int:
+                # Never call Tk from this native callback. Tk's main loop releases
+                # the GIL while waiting in user32, so re-entering Tk here can crash
+                # CPython. Only publish a flag for the scheduled Tk-thread drain.
+                try:
+                    if message == BUTTON_MESSAGE_CLICK and self._enabled:
+                        self._native_invoke_pending = True
+                    elif message == BUTTON_MESSAGE_NCDESTROY:
+                        self._native_subclass_installed = False
+                except (AttributeError, RuntimeError):
+                    pass
+                return int(
+                    comctl32.DefSubclassProc(
+                        native_hwnd,
+                        message,
+                        wparam,
+                        lparam,
+                    )
+                )
+
+            if not comctl32.SetWindowSubclass(
+                wintypes.HWND(hwnd),
+                subclass_proc,
+                ctypes.c_size_t(subclass_id),
+                ctypes.c_size_t(0),
+            ):
+                return
+            self._native_hwnd = hwnd
+            self._native_subclass_id = subclass_id
+            # The OS retains only a function pointer. Keep the ctypes callback
+            # alive until RemoveWindowSubclass succeeds or the HWND is gone.
+            self._native_subclass_callback = subclass_proc
+            self._native_subclass_installed = True
+        except (AttributeError, OSError, TypeError, ValueError, tk.TclError):
+            self._native_hwnd = None
+            self._native_subclass_id = 0
+            self._native_subclass_callback = None
+            self._native_subclass_installed = False
+
+    def _schedule_native_invoke_drain(self) -> None:
+        if self._destroyed or not self._native_subclass_installed:
+            return
+        try:
+            owner = self.winfo_toplevel()
+            members = getattr(owner, "_golden_finger_native_buttons", None)
+            if members is None:
+                members = set()
+                setattr(owner, "_golden_finger_native_buttons", members)
+            members.add(self)
+            self._native_drain_owner = owner
+            if getattr(owner, "_golden_finger_native_drain_job", None) is None:
+                job = owner.after(
+                    BUTTON_NATIVE_ACTIVE_DRAIN_MS,
+                    lambda current_owner=owner: CircularButton._drain_native_invoke_group(
+                        current_owner
+                    ),
+                )
+                setattr(owner, "_golden_finger_native_drain_job", job)
+        except tk.TclError:
+            self._native_drain_owner = None
+
+    def _accelerate_native_invoke_drain(self) -> None:
+        """Replace a dormant 500 ms wake-up when a decision becomes actionable."""
+
+        owner = self._native_drain_owner
+        if owner is None or self._destroyed or not self._native_subclass_installed:
+            return
+        try:
+            job = getattr(owner, "_golden_finger_native_drain_job", None)
+            if job is not None:
+                owner.after_cancel(job)
+            job = owner.after(
+                BUTTON_NATIVE_ACTIVE_DRAIN_MS,
+                lambda current_owner=owner: CircularButton._drain_native_invoke_group(
+                    current_owner
+                ),
+            )
+            setattr(owner, "_golden_finger_native_drain_job", job)
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _drain_native_invoke_group(owner: tk.Misc) -> None:
+        try:
+            setattr(owner, "_golden_finger_native_drain_job", None)
+            members = getattr(owner, "_golden_finger_native_buttons", set())
+            for button in tuple(members):
+                if button._destroyed:
+                    members.discard(button)
+                else:
+                    button._drain_native_invoke()
+            if members and owner.winfo_exists():
+                delay_ms = (
+                    BUTTON_NATIVE_ACTIVE_DRAIN_MS
+                    if any(button._enabled for button in members)
+                    else BUTTON_NATIVE_IDLE_DRAIN_MS
+                )
+                job = owner.after(
+                    delay_ms,
+                    lambda current_owner=owner: CircularButton._drain_native_invoke_group(
+                        current_owner
+                    ),
+                )
+                setattr(owner, "_golden_finger_native_drain_job", job)
+        except tk.TclError:
+            try:
+                setattr(owner, "_golden_finger_native_drain_job", None)
+            except tk.TclError:
+                pass
+
+    def _drain_native_invoke(self) -> None:
+        if self._destroyed:
+            return
+        should_invoke = self._native_invoke_pending
+        self._native_invoke_pending = False
+        if should_invoke and self._enabled:
+            tk.Button.invoke(self)
+
+    def _unschedule_native_invoke_drain(self) -> None:
+        owner = self._native_drain_owner
+        self._native_drain_owner = None
+        if owner is None:
+            return
+        try:
+            members = getattr(owner, "_golden_finger_native_buttons", set())
+            members.discard(self)
+            if members:
+                return
+            job = getattr(owner, "_golden_finger_native_drain_job", None)
+            if job is not None:
+                owner.after_cancel(job)
+            setattr(owner, "_golden_finger_native_drain_job", None)
+        except tk.TclError:
+            pass
+
+    def _remove_native_invoke_bridge(self) -> None:
+        callback = self._native_subclass_callback
+        hwnd = self._native_hwnd
+        if (
+            os.name == "nt"
+            and self._native_subclass_installed
+            and ButtonSubclassProc is not None
+            and callback is not None
+            and hwnd is not None
+        ):
+            try:
+                removed = bool(
+                    ctypes.windll.comctl32.RemoveWindowSubclass(
+                        wintypes.HWND(hwnd),
+                        callback,
+                        ctypes.c_size_t(self._native_subclass_id),
+                    )
+                )
+                if not removed and ctypes.windll.user32.IsWindow(
+                    ctypes.c_void_p(hwnd)
+                ):
+                    # Keep the callback alive if the OS may still call it.
+                    return
+            except (AttributeError, OSError, TypeError, ValueError):
+                return
+        self._native_subclass_installed = False
+        self._native_subclass_callback = None
+        self._native_hwnd = None
+        self._native_subclass_id = 0
+
+    def _on_destroy(self, event: tk.Event[Any]) -> None:
+        if event.widget is not self or self._destroyed:
+            return
+        self._destroyed = True
+        self._native_invoke_pending = False
+        self._unschedule_native_invoke_drain()
+        self._remove_native_invoke_bridge()
+
+    def invoke(self) -> Any:
+        """Keep every programmatic path behind the same disabled-state guard."""
+
+        if not self._enabled:
+            return ""
+        return tk.Button.invoke(self)
+
+    def _on_enter(self, event: tk.Event[Any]) -> None:
+        if self._enabled and self._inside_circle(event.x, event.y):
             self._hovered = True
+            self.configure(cursor="hand2")
             self._redraw()
+
+    def _on_motion(self, event: tk.Event[Any]) -> None:
+        if not self._enabled:
+            return
+        hovered = self._inside_circle(event.x, event.y)
+        if hovered == self._hovered:
+            return
+        self._hovered = hovered
+        if not hovered:
+            self._pressed = False
+        self.configure(cursor="hand2" if hovered else "")
+        self._redraw()
 
     def _on_leave(self, _event: tk.Event[Any]) -> None:
         self._hovered = False
         self._pressed = False
+        self.configure(cursor="")
         self._redraw()
 
-    def _on_press(self, _event: tk.Event[Any]) -> None:
-        if self._enabled:
-            self.focus_set()
-            self._pressed = True
-            self._redraw()
+    def _on_press(self, event: tk.Event[Any]) -> str | None:
+        if not self._enabled or not self._inside_circle(event.x, event.y):
+            return "break"
+        self.focus_set()
+        self._pressed = True
+        self._redraw()
+        return None
 
-    def _on_release(self, event: tk.Event[Any]) -> None:
+    def _on_release(self, event: tk.Event[Any]) -> str | None:
         if not self._enabled:
-            return
-        was_pressed = self._pressed
+            return "break"
+        inside = self._inside_circle(event.x, event.y)
+        was_pressed = self._pressed and inside
         self._pressed = False
+        self._hovered = inside
+        self.configure(cursor="hand2" if inside else "")
         self._redraw()
-        if was_pressed and 0 <= event.x <= self._diameter and 0 <= event.y <= self._diameter:
-            self.command()
+        return None if was_pressed else "break"
 
     def _on_focus_in(self, _event: tk.Event[Any]) -> None:
         self._focused = True
@@ -717,22 +1510,23 @@ class CircularButton(tk.Canvas):
         self._pressed = False
         self._redraw()
 
-    def _on_space_press(self, _event: tk.Event[Any]) -> str:
+    def _on_space_press(self, _event: tk.Event[Any]) -> str | None:
         if self._enabled:
             self._pressed = True
             self._redraw()
+            return None
         return "break"
 
-    def _on_space_release(self, _event: tk.Event[Any]) -> str:
+    def _on_space_release(self, _event: tk.Event[Any]) -> str | None:
         if self._enabled and self._pressed:
             self._pressed = False
             self._redraw()
-            self.command()
+            return None
         return "break"
 
     def _on_return(self, _event: tk.Event[Any]) -> str:
         if self._enabled:
-            self.command()
+            self.invoke()
         return "break"
 
 
@@ -1010,6 +1804,11 @@ class RequestStore:
         self._shutting_down = False
         self._restart_pending = False
         self._poll_policy = normalize_poll_policy(settings or default_ui_settings())
+        self._gui_revision = 0
+        self._gui_cache_revision = -1
+        self._gui_cache_rows: tuple[dict[str, Any], ...] = ()
+        self._gui_cache_counts = (0, 0)
+        self._next_expiry_check_monotonic = 0.0
 
     def current_poll_policy(self) -> dict[str, Any]:
         with self._condition:
@@ -1018,6 +1817,62 @@ class RequestStore:
     def is_stopping(self) -> bool:
         with self._condition:
             return self._shutting_down
+
+    def _mark_gui_changed_locked(self, *, expiry_changed: bool = True) -> None:
+        """Invalidate the bounded GUI snapshot and wake all protocol waiters."""
+
+        self._gui_revision += 1
+        if expiry_changed:
+            self._next_expiry_check_monotonic = 0.0
+        self._condition.notify_all()
+
+    def _ensure_gui_cache_locked(self) -> None:
+        if self._gui_cache_revision == self._gui_revision:
+            return
+        rows: list[dict[str, Any]] = []
+        terminal_rows = 0
+        pending = 0
+        running = 0
+        for record in reversed(self._records.values()):
+            if record.state == "pending":
+                pending += 1
+            elif record.state == "running":
+                running += 1
+            is_active = record.state in ACTIVE_STATES
+            if not is_active and terminal_rows >= GUI_TERMINAL_HISTORY_LIMIT:
+                continue
+            if not is_active:
+                terminal_rows += 1
+            rows.append(
+                {
+                    **record.public_snapshot(),
+                    "risk": record.frozen["risk"],
+                    "source_label": record.frozen["source_label"],
+                    "source_project": record.frozen["source_project"],
+                    "source_task": record.frozen["source_task"],
+                    "codex_thread_id": record.codex_thread_id,
+                }
+            )
+        self._gui_cache_rows = tuple(rows)
+        self._gui_cache_counts = (pending, running)
+        self._gui_cache_revision = self._gui_revision
+
+    def gui_snapshot(
+        self,
+        changed_since: int | None = None,
+    ) -> tuple[int, list[dict[str, Any]] | None, int, int]:
+        """Return one bounded snapshot, omitting rows when nothing has changed."""
+
+        with self._condition:
+            self._expire_locked()
+            self._ensure_gui_cache_locked()
+            rows = (
+                None
+                if changed_since == self._gui_revision
+                else list(self._gui_cache_rows)
+            )
+            pending, running = self._gui_cache_counts
+            return self._gui_revision, rows, pending, running
 
     def update_poll_policy(self, settings: dict[str, Any]) -> dict[str, Any]:
         policy = normalize_poll_policy(settings)
@@ -1068,17 +1923,29 @@ class RequestStore:
 
     def _expire_locked(self) -> None:
         now = time.monotonic()
+        if now < self._next_expiry_check_monotonic:
+            return
+        changed = False
+        next_check = float("inf")
         for record in self._records.values():
             if record.state == "pending" and now >= record.expires_monotonic:
                 self._expire_pending_locked(
                     record,
                     message="The request expired before a human decision.",
                 )
+                changed = True
+            if record.state == "pending":
+                next_check = min(next_check, record.expires_monotonic)
+            elif record.terminal_monotonic is not None:
+                next_check = min(
+                    next_check,
+                    record.terminal_monotonic + TERMINAL_RETENTION_SECONDS,
+                )
         removable = [
             request_id
             for request_id, record in self._records.items()
             if record.terminal_monotonic is not None
-            and now - record.terminal_monotonic > TERMINAL_RETENTION_SECONDS
+            and now - record.terminal_monotonic >= TERMINAL_RETENTION_SECONDS
         ]
         for request_id in removable:
             record = self._records.pop(request_id)
@@ -1089,7 +1956,18 @@ class RequestStore:
             if self._idempotency.get(key) == request_id:
                 del self._idempotency[key]
         if removable:
-            self._condition.notify_all()
+            next_check = float("inf")
+            for record in self._records.values():
+                if record.state == "pending":
+                    next_check = min(next_check, record.expires_monotonic)
+                elif record.terminal_monotonic is not None:
+                    next_check = min(
+                        next_check,
+                        record.terminal_monotonic + TERMINAL_RETENTION_SECONDS,
+                    )
+        if changed or removable:
+            self._mark_gui_changed_locked(expiry_changed=False)
+        self._next_expiry_check_monotonic = next_check
 
     def submit(
         self,
@@ -1131,13 +2009,16 @@ class RequestStore:
                         details={"request_id": existing.request_id},
                     )
                 else:
-                    if existing.codex_thread_id is None:
+                    if (
+                        existing.codex_thread_id is None
+                        and normalized_codex_thread_id is not None
+                    ):
                         existing.codex_thread_id = normalized_codex_thread_id
+                        self._mark_gui_changed_locked()
                     return existing.public_snapshot(), True, existing.claim_token
 
-            active_count = sum(
-                record.state in ACTIVE_STATES for record in self._records.values()
-            )
+            self._ensure_gui_cache_locked()
+            active_count = sum(self._gui_cache_counts)
             if active_count >= MAX_PENDING_REQUESTS:
                 raise RelayError(
                     "queue_full",
@@ -1164,7 +2045,7 @@ class RequestStore:
             )
             self._records[request_id] = record
             self._idempotency[idempotency_scope] = request_id
-            self._condition.notify_all()
+            self._mark_gui_changed_locked()
             return record.public_snapshot(), False, claim_token
 
     def _get_locked(self, request_id: Any) -> RequestRecord:
@@ -1222,9 +2103,10 @@ class RequestStore:
                         record,
                         message="The configured pending polling limit was reached.",
                     )
-                    self._condition.notify_all()
+                    self._mark_gui_changed_locked()
                     return record.public_snapshot()
                 record.pending_polls_used += 1
+                self._mark_gui_changed_locked()
             deadline = time.monotonic() + bounded_wait
             while record.state in ACTIVE_STATES and not self._shutting_down:
                 remaining = deadline - time.monotonic()
@@ -1242,7 +2124,7 @@ class RequestStore:
                     record,
                     message="The configured pending polling limit was reached.",
                 )
-                self._condition.notify_all()
+                self._mark_gui_changed_locked()
             return record.public_snapshot()
 
     def cancel(self, request_id: Any, claim_token: Any) -> dict[str, Any]:
@@ -1256,13 +2138,43 @@ class RequestStore:
                     "decision": "cancelled",
                     "message": "The pending request was cancelled by the caller.",
                 }
-                self._condition.notify_all()
+                self._mark_gui_changed_locked()
                 return record.public_snapshot()
             if record.state == "running":
                 raise RelayError(
                     "already_started",
                     "The command has already started; cancellation cannot revoke approval.",
                 )
+            return record.public_snapshot()
+
+    def cancel_from_gui(self, request_id: str) -> dict[str, Any]:
+        """Stop one pending wait without expressing approval or rejection."""
+
+        with self._condition:
+            record = self._get_locked(request_id)
+            if record.state != "pending":
+                raise RelayError(
+                    "decision_already_made",
+                    "This request is no longer pending.",
+                )
+            now = iso_timestamp()
+            record.state = "cancelled"
+            record.updated_at = now
+            record.terminal_monotonic = time.monotonic()
+            record.receipt = {
+                "human_action": "stopped_waiting_once",
+                "decided_at": now,
+                "request_hash": record.request_hash,
+            }
+            record.result = {
+                "decision": "cancelled",
+                "reason_code": "stopped_by_user",
+                "message": (
+                    "The user stopped waiting without approving or rejecting "
+                    "the request."
+                ),
+            }
+            self._mark_gui_changed_locked()
             return record.public_snapshot()
 
     def reject_from_gui(self, request_id: str) -> dict[str, Any]:
@@ -1286,7 +2198,7 @@ class RequestStore:
                 "decision": "rejected",
                 "reply_text": "拒绝",
             }
-            self._condition.notify_all()
+            self._mark_gui_changed_locked()
             return record.public_snapshot()
 
     def approve_from_gui(self, request_id: str) -> dict[str, Any]:
@@ -1313,11 +2225,11 @@ class RequestStore:
                     "decision": "approved",
                     "reply_text": record.frozen["approved_reply"],
                 }
-                self._condition.notify_all()
+                self._mark_gui_changed_locked()
                 return record.public_snapshot()
 
             record.state = "running"
-            self._condition.notify_all()
+            self._mark_gui_changed_locked()
             worker = threading.Thread(
                 target=self._execute_command,
                 args=(record.request_id,),
@@ -1351,7 +2263,7 @@ class RequestStore:
                 "message": message,
                 **(result or {}),
             }
-            self._condition.notify_all()
+            self._mark_gui_changed_locked()
         if job is not None:
             job.close()
 
@@ -1404,7 +2316,7 @@ class RequestStore:
                     "decision": "approved",
                     "message": "The window closed before the approved process was created.",
                 }
-                self._condition.notify_all()
+                self._mark_gui_changed_locked()
                 return
             frozen = dict(record.frozen)
 
@@ -1465,7 +2377,7 @@ class RequestStore:
                     "decision": "approved",
                     "message": "The window closed before the approved process was created.",
                 }
-                self._condition.notify_all()
+                self._mark_gui_changed_locked()
                 return
             command = [frozen["executable"], *frozen["arguments"]]
             try:
@@ -1479,7 +2391,7 @@ class RequestStore:
                     "message": f"Process containment failed: {exc.message}",
                     "error": exc.as_dict()["error"],
                 }
-                self._condition.notify_all()
+                self._mark_gui_changed_locked()
                 return
             creation_flags = 0
             if os.name == "nt":
@@ -1506,7 +2418,7 @@ class RequestStore:
                     "decision": "approved",
                     "message": f"Process creation failed: {type(exc).__name__}: {exc}",
                 }
-                self._condition.notify_all()
+                self._mark_gui_changed_locked()
                 return
             try:
                 process_job.assign(process)
@@ -1525,7 +2437,7 @@ class RequestStore:
                     "message": f"Process containment failed: {exc.message}",
                     "error": exc.as_dict()["error"],
                 }
-                self._condition.notify_all()
+                self._mark_gui_changed_locked()
                 return
             if self._shutting_down:
                 try:
@@ -1543,12 +2455,12 @@ class RequestStore:
                     "decision": "approved",
                     "message": "The window closed as the approved process was created.",
                 }
-                self._condition.notify_all()
+                self._mark_gui_changed_locked()
                 return
             record.process = process
             record.process_job = process_job
             record.updated_at = iso_timestamp()
-            self._condition.notify_all()
+            self._mark_gui_changed_locked()
 
         stdout_bytes = bytearray()
         stderr_bytes = bytearray()
@@ -1631,19 +2543,8 @@ class RequestStore:
             )
 
     def rows_for_gui(self) -> list[dict[str, Any]]:
-        with self._condition:
-            self._expire_locked()
-            return [
-                {
-                    **record.public_snapshot(),
-                    "risk": record.frozen["risk"],
-                    "source_label": record.frozen["source_label"],
-                    "source_project": record.frozen["source_project"],
-                    "source_task": record.frozen["source_task"],
-                    "codex_thread_id": record.codex_thread_id,
-                }
-                for record in reversed(self._records.values())
-            ]
+        _revision, rows, _pending, _running = self.gui_snapshot()
+        return rows or []
 
     def detail_for_gui(self, request_id: str) -> dict[str, Any]:
         with self._condition:
@@ -1654,11 +2555,8 @@ class RequestStore:
             }
 
     def active_counts(self) -> tuple[int, int]:
-        with self._condition:
-            self._expire_locked()
-            pending = sum(record.state == "pending" for record in self._records.values())
-            running = sum(record.state == "running" for record in self._records.values())
-            return pending, running
+        _revision, _rows, pending, running = self.gui_snapshot()
+        return pending, running
 
     def restart_is_pending(self) -> bool:
         with self._condition:
@@ -1673,16 +2571,17 @@ class RequestStore:
             if self._restart_pending:
                 return False, "restart_already_pending"
             self._expire_locked()
-            if any(record.state in ACTIVE_STATES for record in self._records.values()):
+            self._ensure_gui_cache_locked()
+            if sum(self._gui_cache_counts):
                 return False, "relay_requests_active"
             self._restart_pending = True
-            self._condition.notify_all()
+            self._mark_gui_changed_locked()
             return True, "restart_gate_acquired"
 
     def end_codex_restart(self) -> None:
         with self._condition:
             self._restart_pending = False
-            self._condition.notify_all()
+            self._mark_gui_changed_locked()
 
     def shutdown(self) -> None:
         with self._condition:
@@ -1701,7 +2600,7 @@ class RequestStore:
                     }
                 elif record.state == "running" and record.process is not None:
                     processes.append((record.process, record.process_job))
-            self._condition.notify_all()
+            self._mark_gui_changed_locked()
         for process, process_job in processes:
             try:
                 if process_job is not None and process_job.active:
@@ -2086,17 +2985,25 @@ class RelayWindow:
         self._detail_request_id: str | None = None
         self._detail_text: str | None = None
         self._detail_expanded = False
-        self._policy_expanded = False
+        self._task_tree_signature: tuple[Any, ...] | None = None
+        self._content_render_signature: tuple[Any, ...] | None = None
+        self._inventory_render_signature: tuple[Any, ...] | None = None
+        self._status_text: str | None = None
         self._task_filter = "active"
         self._codex_tasks: dict[str, CodexTask] = {}
         self._request_rows: dict[str, dict[str, Any]] = {}
         self._restart_in_progress = False
         self._restart_cancel = threading.Event()
         self._diagnostic_window: tk.Toplevel | None = None
+        self._diagnostic_text: tk.Text | None = None
         self._known_request_ids: set[str] = set()
+        self._store_gui_revision: int | None = None
         self._attention_active = False
         self._activation_job: str | None = None
-        self._policy_update_job: str | None = None
+        self._decision_layout_job: str | None = None
+        self._responsive_layout_job: str | None = None
+        self._responsive_layout_signature: tuple[Any, ...] | None = None
+        self._connection_render_signature: tuple[Any, ...] | None = None
         self._hit_shield_sync_job: str | None = None
         self._hit_shield_window: tk.Toplevel | None = None
         self._hit_shield_ready = False
@@ -2116,18 +3023,13 @@ class RelayWindow:
             master=root,
             value=self._ui_settings["sound_enabled"],
         )
-        self.poll_wait_seconds = tk.StringVar(
-            master=root,
-            value=str(self._ui_settings["poll_wait_seconds"]),
-        )
-        self.max_pending_polls = tk.StringVar(
-            master=root,
-            value=str(self._ui_settings["max_pending_polls"]),
-        )
+        self.task_filter_value = tk.StringVar(master=root, value=self._task_filter)
+        self._inventory_available = False
+        self._inventory_error_code: str | None = "awaiting_thread_metadata"
 
         root.title("Codex金手指")
         root.geometry(f"{WINDOW_DEFAULT_WIDTH}x{WINDOW_DEFAULT_HEIGHT}")
-        root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        root.minsize(WINDOW_SNAP_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(1, weight=1, minsize=WINDOW_MIN_CONTENT_HEIGHT)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -2137,9 +3039,12 @@ class RelayWindow:
             pass
 
         self._build_ui()
+        root.bind("<Configure>", self._schedule_responsive_layout, add="+")
+        root.bind("<Escape>", self._on_escape, add="+")
         self._create_hit_shield()
         self._refresh_theme(force=True)
         self._apply_safe_minimum_size()
+        self._apply_responsive_layout(force=True)
         self.task_monitor.start()
         self.refresh()
 
@@ -2259,26 +3164,29 @@ class RelayWindow:
         )
         self.connection_label = ttk.Label(
             title_row,
-            text="● 本地中继已连接",
-            style="Connection.HAR.TLabel",
+            text="● 本地中继就绪 · 等待 Codex",
+            style="ConnectionWaiting.HAR.TLabel",
         )
         self.connection_label.grid(row=0, column=1, sticky="w", padx=(12, 0))
-        preferences = ttk.Frame(title_row, style="HAR.TFrame")
-        preferences.grid(row=0, column=2, sticky="e")
-        self.policy_toggle_button = ttk.Button(
+        preferences = ttk.Frame(header, style="HAR.TFrame")
+        self.preferences_row = preferences
+        preferences.pack(fill=tk.X, pady=(7, 0))
+        preferences.columnconfigure(0, weight=1)
+        self.wait_policy_label = ttk.Label(
             preferences,
-            text="等待策略",
-            command=self._toggle_policy,
-            style="Quiet.HAR.TButton",
-            takefocus=True,
+            text=(
+                f"等待 {DEFAULT_POLL_WAIT_SECONDS}秒 × "
+                f"{DEFAULT_PENDING_POLL_CYCLES}次"
+            ),
+            style="Meta.HAR.TLabel",
         )
-        self.policy_toggle_button.pack(side=tk.LEFT, padx=(0, 10))
+        self.wait_policy_label.grid(row=0, column=0, sticky="w", padx=(0, 12))
         self.theme_label = ttk.Label(
             preferences,
             text="外观：系统",
             style="Meta.HAR.TLabel",
         )
-        self.theme_label.pack(side=tk.LEFT, padx=(0, 12))
+        self.theme_label.grid(row=0, column=1, sticky="e", padx=(0, 12))
         self.sound_toggle = ttk.Checkbutton(
             preferences,
             text="提示音",
@@ -2287,7 +3195,7 @@ class RelayWindow:
             style="HAR.TCheckbutton",
             takefocus=True,
         )
-        self.sound_toggle.pack(side=tk.LEFT)
+        self.sound_toggle.grid(row=0, column=2, sticky="e")
         self.diagnostics_button = ttk.Button(
             preferences,
             text="诊断",
@@ -2295,103 +3203,13 @@ class RelayWindow:
             style="Diag.HAR.TButton",
             takefocus=True,
         )
-        self.diagnostics_button.pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Label(
+        self.diagnostics_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
+        self.header_subtitle = ttk.Label(
             header,
-            text="人机授权中继 · 每次仅授权当前冻结请求",
+            text="人机授权中继 · 停止仅结束等待，不代表同意或拒绝",
             style="Subtitle.HAR.TLabel",
-        ).pack(anchor=tk.W, pady=(1, 0))
-
-        policy = ttk.Frame(
-            header,
-            padding=(12, 10),
-            style="PolicyCard.HAR.TFrame",
         )
-        self.policy_panel = policy
-        policy.pack(fill=tk.X, pady=(9, 0))
-        policy.columnconfigure(8, weight=1)
-        ttk.Label(
-            policy,
-            text="等待策略",
-            style="PolicyTitle.HAR.TLabel",
-        ).grid(row=0, column=0, sticky="w", padx=(0, 14))
-        ttk.Label(
-            policy,
-            text="轮询",
-            style="PolicyLabel.HAR.TLabel",
-        ).grid(row=0, column=1, sticky="w", padx=(0, 6))
-        validate_integer = (
-            self.root.register(lambda value: not value or value.isdigit()),
-            "%P",
-        )
-        self.poll_wait_spinbox = ttk.Spinbox(
-            policy,
-            from_=MIN_POLL_WAIT_SECONDS,
-            to=MAX_POLL_WAIT_SECONDS,
-            width=6,
-            textvariable=self.poll_wait_seconds,
-            style="HAR.TSpinbox",
-            command=self._schedule_policy_update,
-            validate="key",
-            validatecommand=validate_integer,
-        )
-        self.poll_wait_spinbox.grid(row=0, column=2, sticky="w")
-        ttk.Label(
-            policy,
-            text="秒 ×",
-            style="PolicyUnit.HAR.TLabel",
-        ).grid(row=0, column=3, sticky="w", padx=(6, 12))
-        ttk.Label(
-            policy,
-            text="上限",
-            style="PolicyLabel.HAR.TLabel",
-        ).grid(row=0, column=4, sticky="w", padx=(0, 6))
-        self.max_pending_polls_spinbox = ttk.Spinbox(
-            policy,
-            from_=MIN_PENDING_POLL_CYCLES,
-            to=MAX_PENDING_POLL_CYCLES,
-            width=6,
-            textvariable=self.max_pending_polls,
-            style="HAR.TSpinbox",
-            command=self._schedule_policy_update,
-            validate="key",
-            validatecommand=validate_integer,
-        )
-        self.max_pending_polls_spinbox.grid(row=0, column=5, sticky="w")
-        ttk.Label(
-            policy,
-            text="次 = 总上限",
-            style="PolicyUnit.HAR.TLabel",
-        ).grid(row=0, column=6, sticky="w", padx=(6, 10))
-        self.policy_budget_value_label = ttk.Label(
-            policy,
-            text="",
-            style="BudgetValue.HAR.TLabel",
-        )
-        self.policy_budget_value_label.grid(row=0, column=7, sticky="w")
-
-        self.policy_status_label = ttk.Label(
-            policy,
-            text="",
-            style="PolicyStatus.HAR.TLabel",
-            anchor=tk.W,
-            justify=tk.LEFT,
-        )
-        self.policy_status_label.grid(
-            row=1,
-            column=1,
-            columnspan=8,
-            sticky="w",
-            pady=(3, 0),
-        )
-        for spinbox in (
-            self.poll_wait_spinbox,
-            self.max_pending_polls_spinbox,
-        ):
-            spinbox.bind("<FocusOut>", self._schedule_policy_update)
-        self.poll_wait_seconds.trace_add("write", self._schedule_policy_update)
-        self.max_pending_polls.trace_add("write", self._schedule_policy_update)
-        policy.pack_forget()
+        self.header_subtitle.pack(anchor=tk.W, pady=(3, 0))
 
         main = ttk.Frame(
             self.root,
@@ -2414,26 +3232,31 @@ class RelayWindow:
         left_header = ttk.Frame(left, style="Card.HAR.TFrame")
         left_header.grid(row=0, column=0, sticky="ew")
         left_header.columnconfigure(0, weight=1)
-        ttk.Label(
+        self.task_section_label = ttk.Label(
             left_header,
-            text="进行中的任务",
+            text="任务与请求",
             style="CardSection.HAR.TLabel",
-        ).grid(row=0, column=0, sticky="w")
+        )
+        self.task_section_label.grid(row=0, column=0, sticky="w")
         filters = ttk.Frame(left_header, style="Card.HAR.TFrame")
         filters.grid(row=0, column=1, sticky="e")
-        self.active_filter_button = ttk.Button(
+        self.active_filter_button = ttk.Radiobutton(
             filters,
             text="进行中",
             command=lambda: self._set_task_filter("active"),
-            style="FilterActive.HAR.TButton",
+            variable=self.task_filter_value,
+            value="active",
+            style="Filter.HAR.TRadiobutton",
             takefocus=True,
         )
         self.active_filter_button.pack(side=tk.LEFT)
-        self.all_filter_button = ttk.Button(
+        self.all_filter_button = ttk.Radiobutton(
             filters,
             text="全部",
             command=lambda: self._set_task_filter("all"),
-            style="Filter.HAR.TButton",
+            variable=self.task_filter_value,
+            value="all",
+            style="Filter.HAR.TRadiobutton",
             takefocus=True,
         )
         self.all_filter_button.pack(side=tk.LEFT, padx=(4, 0))
@@ -2479,13 +3302,15 @@ class RelayWindow:
             padding=(11, 10),
             style="Inset.HAR.TFrame",
         )
+        self.restart_panel = restart_panel
         restart_panel.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         restart_panel.columnconfigure(0, weight=1)
-        ttk.Label(
+        self.restart_title_label = ttk.Label(
             restart_panel,
             text="插件更新与安全重启",
             style="InsetTitle.HAR.TLabel",
-        ).grid(row=0, column=0, sticky="w")
+        )
+        self.restart_title_label.grid(row=0, column=0, sticky="w")
         self.restart_status_label = ttk.Label(
             restart_panel,
             text="正在核对任务状态",
@@ -2515,11 +3340,12 @@ class RelayWindow:
         center.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
         center.columnconfigure(0, weight=1)
         center.rowconfigure(6, weight=1)
-        ttk.Label(
+        self.decision_heading_label = ttk.Label(
             center,
             text="授权确认",
             style="CardSection.HAR.TLabel",
-        ).grid(row=0, column=0, sticky="w")
+        )
+        self.decision_heading_label.grid(row=0, column=0, sticky="w")
         self.source_label = ttk.Label(
             center,
             text="尚未选择授权请求",
@@ -2566,7 +3392,15 @@ class RelayWindow:
         self.decision_stage = ttk.Frame(center, style="Card.HAR.TFrame", height=250)
         self.decision_stage.grid(row=6, column=0, sticky="nsew", pady=(6, 0))
         self.decision_stage.grid_propagate(False)
-        self.decision_stage.bind("<Configure>", self._position_decision_buttons)
+        self.decision_stage.bind("<Configure>", self._schedule_decision_layout)
+        self.stop_button = CircularButton(
+            self.decision_stage,
+            text="停止",
+            command=self.stop_selected,
+            variant="neutral",
+            diameter=52,
+        )
+        self.stop_button.set_state(tk.DISABLED)
         self.approve_button = CircularButton(
             self.decision_stage,
             text="同意\n本次",
@@ -2577,13 +3411,14 @@ class RelayWindow:
         self.approve_button.set_state(tk.DISABLED)
         self.reject_button = CircularButton(
             self.decision_stage,
-            text="拒",
+            text="拒绝",
             command=self.reject_selected,
             variant="danger",
             diameter=52,
         )
         self.reject_button.set_state(tk.DISABLED)
         self.approve_button.place(x=70, y=38)
+        self.stop_button.place(x=50, y=35)
         self.reject_button.place(x=205, y=35)
         self.decision_state_label = ttk.Label(
             center,
@@ -2592,16 +3427,22 @@ class RelayWindow:
             anchor=tk.CENTER,
         )
         self.decision_state_label.grid(row=7, column=0, sticky="ew", pady=(3, 0))
-        ttk.Label(
+        self.guard_label = ttk.Label(
             center,
             text="仅授权当前冻结请求",
             style="Guard.HAR.TLabel",
             anchor=tk.CENTER,
-        ).grid(row=8, column=0, sticky="ew", pady=(3, 0))
+        )
+        self.guard_label.grid(row=8, column=0, sticky="ew", pady=(3, 0))
 
         detail_panel = ttk.Frame(main, padding=(14, 13), style="Card.HAR.TFrame")
         self.detail_panel = detail_panel
-        detail_panel.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
+        detail_panel.grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="nsew",
+        )
         detail_panel.columnconfigure(0, weight=1)
         detail_panel.rowconfigure(1, weight=1)
         detail_header = ttk.Frame(detail_panel, style="Card.HAR.TFrame")
@@ -2612,13 +3453,14 @@ class RelayWindow:
             text="详细参数",
             style="CardSection.HAR.TLabel",
         ).grid(row=0, column=0, sticky="w")
-        ttk.Button(
+        self.detail_close_button = ttk.Button(
             detail_header,
-            text="收起 ×",
+            text="返回授权确认",
             command=self.toggle_detail,
             style="Quiet.HAR.TButton",
             takefocus=True,
-        ).grid(row=0, column=1, sticky="e")
+        )
+        self.detail_close_button.grid(row=0, column=1, sticky="e")
         detail_frame = ttk.Frame(detail_panel, style="Card.HAR.TFrame")
         detail_frame.grid(row=1, column=0, sticky="nsew")
         detail_frame.columnconfigure(0, weight=1)
@@ -2647,50 +3489,135 @@ class RelayWindow:
         detail_scroll.grid(row=0, column=1, sticky="ns")
         self.detail.bind("<MouseWheel>", self._on_detail_mousewheel)
         detail_panel.grid_remove()
-        self._update_policy_preview()
-        self._update_policy_toggle_summary()
 
     def _apply_safe_minimum_size(self) -> None:
-        """Keep the compact decision lane usable across supported window sizes."""
+        """Keep the window Snap-safe while retaining a usable vertical floor."""
 
         self.root.update_idletasks()
-        minimum_width = max(
-            WINDOW_MIN_WIDTH,
-            self.header.winfo_reqwidth(),
-        )
         minimum_height = max(
             WINDOW_MIN_HEIGHT,
             self.header.winfo_reqheight()
             + WINDOW_MIN_CONTENT_HEIGHT,
         )
-        self.root.minsize(minimum_width, minimum_height)
+        self.root.minsize(WINDOW_SNAP_MIN_WIDTH, minimum_height)
 
-    def _toggle_policy(self) -> None:
-        self._policy_expanded = not self._policy_expanded
-        if self._policy_expanded:
-            self.policy_panel.pack(fill=tk.X, pady=(9, 0))
-        else:
-            self.policy_panel.pack_forget()
-        self._update_policy_toggle_summary()
+    def _schedule_responsive_layout(
+        self,
+        event: tk.Event[Any] | None = None,
+    ) -> None:
+        if self.closing or (event is not None and event.widget is not self.root):
+            return
+        if self._responsive_layout_job is not None:
+            try:
+                self.root.after_cancel(self._responsive_layout_job)
+            except tk.TclError:
+                pass
+        try:
+            self._responsive_layout_job = self.root.after(
+                RESPONSIVE_LAYOUT_DEBOUNCE_MS,
+                self._run_scheduled_responsive_layout,
+            )
+        except tk.TclError:
+            self._responsive_layout_job = None
 
-    def _update_policy_toggle_summary(self) -> None:
-        wait_value = self.poll_wait_seconds.get().strip() or "—"
-        poll_value = self.max_pending_polls.get().strip() or "—"
-        marker = "▴" if self._policy_expanded else "▾"
-        self.policy_toggle_button.configure(
-            text=f"等待 {wait_value}秒 × {poll_value}次 {marker}"
+    def _run_scheduled_responsive_layout(self) -> None:
+        self._responsive_layout_job = None
+        self._apply_responsive_layout()
+
+    def _apply_responsive_layout(self, *, force: bool = False) -> None:
+        width = max(WINDOW_SNAP_MIN_WIDTH, self.root.winfo_width())
+        layout = responsive_window_layout(width)
+        signature = (width, *layout.values())
+        if not force and signature == self._responsive_layout_signature:
+            return
+
+        self.main.columnconfigure(
+            0,
+            weight=int(layout["left_weight"]),
+            minsize=int(layout["left_minsize"]),
+            uniform="primary",
         )
+        self.main.columnconfigure(
+            1,
+            weight=int(layout["decision_weight"]),
+            minsize=int(layout["decision_minsize"]),
+            uniform="primary",
+        )
+        self.main.columnconfigure(2, weight=0, minsize=0)
+        self.tree.column(
+            "#0",
+            width=int(layout["tree_title_width"]),
+            minwidth=100 if layout["compact"] else 130,
+        )
+        self.tree.column(
+            "state",
+            width=int(layout["tree_state_width"]),
+            minwidth=54,
+        )
+        self.tree.column(
+            "source",
+            width=int(layout["tree_source_width"]),
+            minwidth=60,
+        )
+
+        if layout["show_wait_policy"]:
+            self.wait_policy_label.grid()
+            self.theme_label.grid_configure(column=1, sticky="e")
+            self.restart_button.grid_configure(
+                row=0,
+                column=1,
+                rowspan=2,
+                sticky="e",
+                padx=(10, 0),
+                pady=0,
+            )
+        else:
+            self.wait_policy_label.grid_remove()
+            self.theme_label.grid_configure(column=0, sticky="w")
+            self.restart_button.grid_configure(
+                row=2,
+                column=0,
+                rowspan=1,
+                sticky="ew",
+                padx=0,
+                pady=(8, 0),
+            )
+
+        content_width = max(220, width - 48)
+        left_wrap = max(190, int(layout["left_minsize"]) - 36)
+        decision_wrap = max(190, int(layout["decision_minsize"]) - 36)
+        self.header_subtitle.configure(wraplength=content_width)
+        self.inventory_label.configure(wraplength=left_wrap)
+        self.restart_status_label.configure(wraplength=left_wrap)
+        self.source_label.configure(wraplength=decision_wrap)
+        self.action_label.configure(wraplength=decision_wrap)
+        self.target_label.configure(wraplength=decision_wrap)
+        self.risk_label.configure(wraplength=decision_wrap)
+        if self._detail_expanded:
+            self.detail_panel.grid_configure(
+                column=int(layout["detail_column"]),
+                columnspan=int(layout["detail_columnspan"]),
+            )
+            self.detail_panel.tkraise()
+        self.theme_label.configure(
+            text=self._theme_summary(backdrop_enabled=self._backdrop_enabled)
+        )
+        self._responsive_layout_signature = signature
+        # Recompute the ellipsized task title after the stretched Treeview
+        # column settles at its new width.
+        self._task_tree_signature = None
+        self._schedule_decision_layout()
 
     def _set_task_filter(self, value: str) -> None:
-        if value not in {"active", "all"} or value == self._task_filter:
+        if value not in {"active", "all"}:
+            return
+        self.task_filter_value.set(value)
+        if value == self._task_filter:
             return
         self._task_filter = value
-        self.active_filter_button.configure(
-            style="FilterActive.HAR.TButton" if value == "active" else "Filter.HAR.TButton"
-        )
-        self.all_filter_button.configure(
-            style="FilterActive.HAR.TButton" if value == "all" else "Filter.HAR.TButton"
-        )
+        self.task_section_label.configure(text="任务与请求")
+        self._task_tree_signature = None
+        self._content_render_signature = None
         self._refresh_task_tree()
 
     def _position_decision_buttons(self, _event: tk.Event[Any] | None = None) -> None:
@@ -2698,59 +3625,91 @@ class RelayWindow:
             return
         width = max(1, self.decision_stage.winfo_width())
         height = max(1, self.decision_stage.winfo_height())
-        approve_size = max(138, min(188, int(min(width * 0.58, height * 0.72))))
-        reject_size = max(48, min(58, round(approve_size * 0.31)))
-        approve_x = max(0, (width - approve_size) // 2)
-        approve_y = max(4, (height - approve_size) // 2)
-        reject_x = min(
-            max(0, width - reject_size),
-            approve_x + round(approve_size * 0.76),
-        )
-        reject_y = max(0, approve_y - round(reject_size * 0.18))
+        layout = decision_button_layout(width, height)
+        stop_x, stop_y, auxiliary_size = layout["stop"]
+        approve_x, approve_y, approve_size = layout["approve"]
+        reject_x, reject_y, reject_size = layout["reject"]
         self.approve_button.set_diameter(approve_size)
+        self.stop_button.set_diameter(auxiliary_size)
         self.reject_button.set_diameter(reject_size)
         self.approve_button.place(x=approve_x, y=approve_y)
+        self.stop_button.place(x=stop_x, y=stop_y)
         self.reject_button.place(x=reject_x, y=reject_y)
-        wrap = max(220, width - 12)
-        self.action_label.configure(wraplength=wrap)
-        self.target_label.configure(wraplength=wrap)
-        self.risk_label.configure(wraplength=wrap)
+
+    def _schedule_decision_layout(self, _event: tk.Event[Any] | None = None) -> None:
+        if self.closing:
+            return
+        if self._decision_layout_job is not None:
+            try:
+                self.root.after_cancel(self._decision_layout_job)
+            except tk.TclError:
+                pass
+        try:
+            self._decision_layout_job = self.root.after(
+                DECISION_LAYOUT_DEBOUNCE_MS,
+                self._run_scheduled_decision_layout,
+            )
+        except tk.TclError:
+            self._decision_layout_job = None
+
+    def _run_scheduled_decision_layout(self) -> None:
+        self._decision_layout_job = None
+        self._position_decision_buttons()
+
+    def _set_detail_expanded(
+        self,
+        expanded: bool,
+        *,
+        restore_focus: bool = False,
+    ) -> None:
+        if expanded == self._detail_expanded:
+            return
+        self._detail_expanded = expanded
+        layout = responsive_window_layout(self.root.winfo_width())
+        if expanded:
+            self.detail_panel.grid(
+                row=0,
+                column=int(layout["detail_column"]),
+                columnspan=int(layout["detail_columnspan"]),
+                sticky="nsew",
+            )
+            self.detail_panel.tkraise()
+            try:
+                self.detail_panel.grab_set()
+            except tk.TclError:
+                pass
+            self.detail_toggle_button.configure(text="详细参数 · 已打开")
+            self.root.after_idle(self.detail_close_button.focus_set)
+        else:
+            try:
+                if self.root.grab_current() is self.detail_panel:
+                    self.detail_panel.grab_release()
+            except tk.TclError:
+                pass
+            self.detail_panel.grid_remove()
+            self.detail_toggle_button.configure(text="详细参数 ›")
+            if restore_focus:
+                self.root.after_idle(self.detail_toggle_button.focus_set)
+        self._schedule_hit_shield_sync()
+        self._content_render_signature = None
 
     def toggle_detail(self) -> None:
         if not self._detail_expanded and self.current_request_id is None:
             return
-        self.root.update_idletasks()
-        current_width = max(WINDOW_MIN_WIDTH, self.root.winfo_width())
-        current_height = max(WINDOW_MIN_HEIGHT, self.root.winfo_height())
-        x = self.root.winfo_x()
-        y = self.root.winfo_y()
-        screen_width = max(WINDOW_MIN_WIDTH, self.root.winfo_screenwidth())
-        available_width = max(WINDOW_MIN_WIDTH, screen_width - 32)
+        self._set_detail_expanded(
+            not self._detail_expanded,
+            restore_focus=self._detail_expanded,
+        )
+        if self.current_request_id is not None:
+            self._render_detail(self.current_request_id)
+
+    def _on_escape(self, _event: tk.Event[Any]) -> str | None:
         if not self._detail_expanded:
-            self._detail_expanded = True
-            self.main.columnconfigure(2, weight=0, minsize=WINDOW_DETAIL_WIDTH)
-            self.detail_panel.grid()
-            target_width = min(
-                available_width,
-                max(WINDOW_EXPANDED_MIN_WIDTH, current_width + WINDOW_DETAIL_WIDTH),
-            )
-            expanded_minimum = min(WINDOW_EXPANDED_MIN_WIDTH, available_width)
-            self.root.minsize(expanded_minimum, WINDOW_MIN_HEIGHT)
-            if x + target_width > screen_width - 16:
-                x = max(0, screen_width - target_width - 16)
-            self.detail_toggle_button.configure(text="详细参数 ‹")
-        else:
-            self._detail_expanded = False
-            self.detail_panel.grid_remove()
-            self.main.columnconfigure(2, weight=0, minsize=0)
-            self.root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
-            target_width = max(
-                WINDOW_MIN_WIDTH,
-                min(WINDOW_DEFAULT_WIDTH, current_width - WINDOW_DETAIL_WIDTH),
-            )
-            self.detail_toggle_button.configure(text="详细参数 ›")
-        self.root.geometry(f"{target_width}x{current_height}+{x}+{y}")
-        self._schedule_hit_shield_sync()
+            return None
+        self._set_detail_expanded(False, restore_focus=True)
+        if self.current_request_id is not None:
+            self._render_detail(self.current_request_id)
+        return "break"
 
     def _configure_styles(
         self,
@@ -2792,6 +3751,18 @@ class RelayWindow:
             background=window_background,
             foreground=palette.success_text,
             font=("Microsoft YaHei UI", 9),
+        )
+        style.configure(
+            "ConnectionWaiting.HAR.TLabel",
+            background=window_background,
+            foreground=palette.muted,
+            font=("Microsoft YaHei UI", 9),
+        )
+        style.configure(
+            "ConnectionError.HAR.TLabel",
+            background=window_background,
+            foreground=palette.danger_text,
+            font=("Microsoft YaHei UI", 9, "bold"),
         )
         style.configure(
             "CardSection.HAR.TLabel",
@@ -2924,6 +3895,7 @@ class RelayWindow:
             font=("Microsoft YaHei UI", 9),
             focuscolor=palette.accent,
             indicatorcolor=palette.surface_alt,
+            padding=(8, 12),
         )
         style.map(
             "HAR.TCheckbutton",
@@ -2943,13 +3915,11 @@ class RelayWindow:
             darkcolor=palette.border,
             focuscolor=palette.accent,
             font=("Microsoft YaHei UI", 9),
-            padding=(10, 5),
+            padding=(12, 12),
             relief=tk.FLAT,
         )
         for button_style, background, foreground in (
             ("Quiet.HAR.TButton", palette.surface_alt, palette.muted),
-            ("Filter.HAR.TButton", palette.surface_alt, palette.muted),
-            ("FilterActive.HAR.TButton", palette.selection, palette.text),
             ("Detail.HAR.TButton", palette.surface, palette.accent),
         ):
             style.configure(
@@ -2961,7 +3931,7 @@ class RelayWindow:
                 darkcolor=background,
                 focuscolor=palette.accent,
                 font=("Microsoft YaHei UI", 9),
-                padding=(8, 4),
+                padding=(10, 12),
                 relief=tk.FLAT,
             )
             style.map(
@@ -2969,6 +3939,37 @@ class RelayWindow:
                 background=[("pressed", palette.secondary_hover), ("active", palette.secondary_hover)],
                 foreground=[("disabled", palette.disabled_text)],
             )
+        style.configure(
+            "Filter.HAR.TRadiobutton",
+            background=palette.surface_alt,
+            foreground=palette.muted,
+            bordercolor=palette.border,
+            lightcolor=palette.border,
+            darkcolor=palette.border,
+            focuscolor=palette.accent,
+            indicatorcolor=palette.surface,
+            font=("Microsoft YaHei UI", 9),
+            padding=(10, 12),
+            relief=tk.FLAT,
+        )
+        style.map(
+            "Filter.HAR.TRadiobutton",
+            background=[
+                ("pressed", palette.accent_pressed),
+                ("selected", palette.selection),
+                ("active", palette.accent_hover),
+            ],
+            foreground=[
+                ("disabled", palette.disabled_text),
+                ("pressed", palette.accent_text),
+                ("selected", palette.selection_text),
+                ("active", palette.accent_text),
+            ],
+            indicatorcolor=[
+                ("selected", palette.selection_text),
+                ("active", palette.accent_text),
+            ],
+        )
         style.configure(
             "Restart.HAR.TButton",
             background=palette.accent,
@@ -2978,7 +3979,7 @@ class RelayWindow:
             darkcolor=palette.accent,
             focuscolor=palette.text,
             font=("Microsoft YaHei UI", 9, "bold"),
-            padding=(10, 7),
+            padding=(12, 12),
             relief=tk.FLAT,
         )
         style.map(
@@ -3008,7 +4009,7 @@ class RelayWindow:
             darkcolor=palette.border,
             borderwidth=1,
             relief=tk.FLAT,
-            rowheight=30,
+            rowheight=WINDOW_TOUCH_TARGET,
             font=("Microsoft YaHei UI", 9),
         )
         style.configure(
@@ -3018,12 +4019,12 @@ class RelayWindow:
             bordercolor=palette.border,
             relief=tk.FLAT,
             font=("Microsoft YaHei UI", 9, "bold"),
-            padding=(7, 7),
+            padding=(8, 10),
         )
         style.map(
             "HAR.Treeview",
             background=[("selected", palette.selection)],
-            foreground=[("selected", palette.text)],
+            foreground=[("selected", palette.selection_text)],
         )
         style.map(
             "HAR.Treeview.Heading",
@@ -3037,6 +4038,8 @@ class RelayWindow:
             arrowcolor=palette.muted,
             lightcolor=palette.surface_alt,
             darkcolor=palette.surface_alt,
+            arrowsize=WINDOW_TOUCH_TARGET,
+            width=WINDOW_TOUCH_TARGET,
         )
         style.map(
             "HAR.Vertical.TScrollbar",
@@ -3058,12 +4061,35 @@ class RelayWindow:
         preference_label = preference_labels.get(self._theme_preference, "系统")
         if self._theme_preference == "system":
             preference_label = f"系统 · {effective_label}"
+        if responsive_window_layout(self.root.winfo_width())["compact"]:
+            return f"外观 · {preference_label}"
         backdrop_label = (
             f"背景 {round(WINDOW_BACKGROUND_OPACITY * 100)}% / 文字 100%"
             if backdrop_enabled
             else "不透明背景"
         )
         return f"Codex {preference_label} · {backdrop_label}"
+
+    def _apply_diagnostic_theme(self) -> None:
+        window = self._diagnostic_window
+        text_widget = self._diagnostic_text
+        if window is None or text_widget is None:
+            return
+        try:
+            if not window.winfo_exists():
+                return
+            window.configure(background=self.palette.window)
+            text_widget.configure(
+                background=self.palette.code_background,
+                foreground=self.palette.text,
+                insertbackground=self.palette.text,
+                selectbackground=self.palette.selection,
+                selectforeground=self.palette.selection_text,
+                highlightbackground=self.palette.border,
+                highlightcolor=self.palette.accent,
+            )
+        except tk.TclError:
+            pass
 
     def _fall_back_to_opaque_client(self) -> None:
         self._backdrop_enabled = False
@@ -3078,10 +4104,15 @@ class RelayWindow:
             self.palette,
             parent_background=self.palette.surface,
         )
+        self.stop_button.apply_theme(
+            self.palette,
+            parent_background=self.palette.surface,
+        )
         self.reject_button.apply_theme(
             self.palette,
             parent_background=self.palette.surface,
         )
+        self._apply_diagnostic_theme()
         self.theme_label.configure(text=self._theme_summary(backdrop_enabled=False))
 
     def _apply_theme(self) -> None:
@@ -3119,7 +4150,7 @@ class RelayWindow:
             foreground=palette.text,
             insertbackground=palette.text,
             selectbackground=palette.selection,
-            selectforeground=palette.text,
+            selectforeground=palette.selection_text,
             highlightbackground=palette.border,
             highlightcolor=palette.accent,
         )
@@ -3127,10 +4158,15 @@ class RelayWindow:
             palette,
             parent_background=palette.surface,
         )
+        self.stop_button.apply_theme(
+            palette,
+            parent_background=palette.surface,
+        )
         self.reject_button.apply_theme(
             palette,
             parent_background=palette.surface,
         )
+        self._apply_diagnostic_theme()
         self.tree.tag_configure("pending", foreground=palette.accent)
         self.tree.tag_configure("running", foreground=palette.accent)
         self.tree.tag_configure("failed", foreground=palette.danger_text)
@@ -3168,119 +4204,6 @@ class RelayWindow:
                 f"本窗口已应用该选择，但无法保存到下次启动：{exc}",
                 parent=self.root,
             )
-
-    @staticmethod
-    def _format_duration(seconds: int) -> str:
-        if seconds % 3_600 == 0:
-            return f"{seconds // 3_600} 小时"
-        if seconds % 60 == 0:
-            return f"{seconds // 60} 分钟"
-        if seconds >= 60:
-            minutes, remainder = divmod(seconds, 60)
-            return f"{minutes} 分 {remainder} 秒"
-        return f"{seconds} 秒"
-
-    def _policy_form_settings(self) -> dict[str, Any]:
-        try:
-            poll_wait_seconds = int(self.poll_wait_seconds.get().strip())
-            max_pending_polls = int(self.max_pending_polls.get().strip())
-        except ValueError as exc:
-            raise ValueError("两个设置都必须填写整数") from exc
-        if not MIN_POLL_WAIT_SECONDS <= poll_wait_seconds <= MAX_POLL_WAIT_SECONDS:
-            raise ValueError(
-                f"单次轮询应为 {MIN_POLL_WAIT_SECONDS}–{MAX_POLL_WAIT_SECONDS} 秒"
-            )
-        if not MIN_PENDING_POLL_CYCLES <= max_pending_polls <= MAX_PENDING_POLL_CYCLES:
-            raise ValueError(
-                "等待确认轮询次数应为 "
-                f"{MIN_PENDING_POLL_CYCLES}–{MAX_PENDING_POLL_CYCLES} 次"
-            )
-        pending_budget = poll_wait_seconds * max_pending_polls
-        if not MIN_APPROVAL_EXPIRY_SECONDS <= pending_budget <= MAX_APPROVAL_EXPIRY_SECONDS:
-            raise ValueError(
-                "单次轮询 × 次数应介于 "
-                f"{MIN_APPROVAL_EXPIRY_SECONDS}–{MAX_APPROVAL_EXPIRY_SECONDS} 秒"
-            )
-        return {
-            "sound_enabled": bool(self.sound_enabled.get()),
-            "poll_wait_seconds": poll_wait_seconds,
-            "max_pending_polls": max_pending_polls,
-        }
-
-    def _schedule_policy_update(self, *_args: object) -> None:
-        if self.closing:
-            return
-        self._update_policy_preview(pending=True)
-        if self._policy_update_job is not None:
-            try:
-                self.root.after_cancel(self._policy_update_job)
-            except tk.TclError:
-                pass
-        try:
-            self._policy_update_job = self.root.after(
-                POLICY_APPLY_DEBOUNCE_MS,
-                self._apply_poll_policy,
-            )
-        except tk.TclError:
-            self._policy_update_job = None
-
-    def _update_policy_preview(self, *, pending: bool = False) -> None:
-        self._update_policy_toggle_summary()
-        try:
-            policy = normalize_poll_policy(self._policy_form_settings())
-        except ValueError as exc:
-            self.policy_budget_value_label.configure(text="—")
-            self.policy_status_label.configure(
-                text=f"未应用 · {exc}",
-                style="PolicyError.HAR.TLabel",
-            )
-            return
-        budget = int(policy["pending_wait_budget_seconds"])
-        formatted_budget = self._format_duration(budget)
-        budget_label = (
-            f"{budget} 秒"
-            if formatted_budget == f"{budget} 秒"
-            else f"{budget} 秒 · {formatted_budget}"
-        )
-        self.policy_budget_value_label.configure(text=budget_label)
-        self.policy_status_label.configure(
-            text=(
-                "自动应用中… · 仅影响新请求"
-                if pending
-                else "已生效 · 仅影响新请求"
-            ),
-            style="PolicyStatus.HAR.TLabel",
-        )
-
-    def _apply_poll_policy(self) -> None:
-        self._policy_update_job = None
-        if self.closing:
-            return
-        try:
-            settings = self._policy_form_settings()
-            policy = self.store.update_poll_policy(settings)
-        except (RelayError, ValueError) as exc:
-            message = exc.message if isinstance(exc, RelayError) else str(exc)
-            self.policy_status_label.configure(
-                text=f"尚未应用：{message}",
-                style="PolicyError.HAR.TLabel",
-            )
-            return
-        settings["command_timeout_seconds"] = policy["command_timeout_seconds"]
-        self._ui_settings.update(settings)
-        try:
-            save_ui_settings(self._ui_settings)
-        except OSError as exc:
-            self.policy_status_label.configure(
-                text=f"本次运行已应用，但无法写入下次启动：{exc}",
-                style="PolicyError.HAR.TLabel",
-            )
-            return
-        self._update_policy_preview()
-        self.policy_status_label.configure(
-            text="已应用 · 仅影响新请求",
-            style="PolicySuccess.HAR.TLabel",
-        )
 
     def _play_notification_sound(self) -> None:
         if not self.sound_enabled.get():
@@ -3390,6 +4313,13 @@ class RelayWindow:
 
     def _refresh_task_tree(self) -> None:
         selected_before = self.current_item_id
+        try:
+            tree_title_width = int(self.tree.column("#0", "width"))
+        except (tk.TclError, TypeError, ValueError):
+            tree_title_width = 120
+        # Treeview reserves leading space for its native tree affordance. Seven
+        # pixels per display unit is a conservative YaHei UI approximation.
+        title_units = max(8, (tree_title_width - 22) // 7)
         entries: list[tuple[str, str, tuple[str, str], str]] = []
         for row in self._request_rows.values():
             if self._task_filter == "active" and row["state"] not in ACTIVE_STATES:
@@ -3397,7 +4327,11 @@ class RelayWindow:
             entries.append(
                 (
                     self._request_item_id(str(row["request_id"])),
-                    self._one_line(row.get("exact_action"), fallback="授权请求", limit=96),
+                    ellipsize_display_text(
+                        row.get("exact_action"),
+                        fallback="授权请求",
+                        max_units=title_units,
+                    ),
                     (
                         self._state_label(str(row["state"])),
                         self._one_line(
@@ -3415,7 +4349,11 @@ class RelayWindow:
             entries.append(
                 (
                     self._codex_item_id(task.task_id),
-                    self._one_line(task.title, fallback="未命名 Codex 任务", limit=96),
+                    ellipsize_display_text(
+                        task.title,
+                        fallback="未命名 Codex 任务",
+                        max_units=title_units,
+                    ),
                     (
                         self._codex_state_label(task.status),
                         self._one_line(
@@ -3427,6 +4365,10 @@ class RelayWindow:
                     task.status,
                 )
             )
+
+        entries_signature = tuple(entries)
+        if entries_signature == self._task_tree_signature:
+            return
 
         existing = set(self.tree.get_children())
         incoming = {entry[0] for entry in entries}
@@ -3447,14 +4389,21 @@ class RelayWindow:
             self.tree.move(item_id, "", index)
 
         if selected_before and self.tree.exists(selected_before):
-            self.tree.selection_set(selected_before)
-            self.tree.focus(selected_before)
+            if self.tree.selection() != (selected_before,):
+                self.tree.selection_set(selected_before)
+            if self.tree.focus() != selected_before:
+                self.tree.focus(selected_before)
+        self._task_tree_signature = entries_signature
 
     def _select_item(self, item_id: str) -> None:
         if not self.tree.exists(item_id):
             return
-        self.tree.selection_set(item_id)
-        self.tree.focus(item_id)
+        if self.tree.selection() != (item_id,):
+            self.tree.selection_set(item_id)
+        if self.tree.focus() != item_id:
+            self.tree.focus(item_id)
+        if self.current_item_id == item_id:
+            return
         self.tree.see(item_id)
         self.current_item_id = item_id
         if item_id.startswith("request:"):
@@ -3465,36 +4414,85 @@ class RelayWindow:
             self.current_request_id = None
             self._render_codex_task(item_id.removeprefix("codex:"))
 
+    def _set_decision_mode(self, mode: str) -> None:
+        if mode == "task":
+            if self._detail_expanded:
+                self._set_detail_expanded(False)
+            self.decision_heading_label.configure(text="任务详情")
+            self.decision_stage.grid_remove()
+            self.guard_label.configure(text="仅用于安全重启判断，不会执行操作")
+            return
+        if mode == "empty":
+            if self._detail_expanded:
+                self._set_detail_expanded(False)
+            self.decision_heading_label.configure(text="等待授权请求")
+            self.decision_stage.grid_remove()
+            self.guard_label.configure(text="收到请求后会显示可核对的单次动作")
+            return
+        self.decision_heading_label.configure(text="授权确认")
+        self.decision_stage.grid()
+        self._schedule_decision_layout()
+        self.guard_label.configure(text="仅授权当前冻结请求")
+
     def _render_empty_state(self) -> None:
+        has_hidden_items = bool(self._request_rows or self._codex_tasks)
+        render_signature = (
+            "empty",
+            self._task_filter,
+            has_hidden_items,
+            self._inventory_available,
+            self._inventory_error_code,
+        )
+        if render_signature == self._content_render_signature:
+            return
         self.current_request_id = None
-        self.source_label.configure(text="尚未选择授权请求")
-        self.action_label.configure(text="等待一个明确、单次、可核对的动作")
+        self._set_decision_mode("empty")
+        source_text, action_text, state_text, empty_detail = empty_state_copy(
+            task_filter=self._task_filter,
+            has_hidden_items=has_hidden_items,
+            inventory_available=self._inventory_available,
+            inventory_error_code=self._inventory_error_code,
+        )
+        self.source_label.configure(text=source_text)
+        self.action_label.configure(text=action_text)
         self.target_label.configure(text="")
         self.risk_label.configure(text="")
-        self.decision_state_label.configure(text="未选择待确认请求")
+        self.decision_state_label.configure(text=state_text)
         self.detail_toggle_button.configure(state=tk.DISABLED, text="详细参数 ›")
         self.approve_button.set_state(tk.DISABLED)
+        self.stop_button.set_state(tk.DISABLED)
         self.reject_button.set_state(tk.DISABLED)
         self._detail_request_id = None
-        self._set_detail(
-            "等待 Codex 提交一个明确、单次、可核对的授权请求。",
-            reset_scroll=True,
-        )
+        self._set_detail(empty_detail, reset_scroll=True)
+        self._content_render_signature = render_signature
 
     def _render_codex_task(self, task_id: str) -> None:
         task = self._codex_tasks.get(task_id)
         if task is None:
             self._render_empty_state()
             return
-        self.source_label.configure(text="Codex 任务")
+        render_signature = (
+            "task",
+            task.task_id,
+            task.title,
+            task.status,
+            task.cwd,
+            task.kind,
+            task.updated_at,
+        )
+        if render_signature == self._content_render_signature:
+            return
+        self._set_decision_mode("task")
+        self.source_label.configure(text="只读 Codex 任务")
         self.action_label.configure(text=task.title)
-        self.target_label.configure(text=self._compact_source(task.cwd))
-        self.risk_label.configure(text="任务状态仅用于安全重启判断，不会触发任何操作。")
+        self.target_label.configure(text=f"项目 · {self._compact_source(task.cwd)}")
+        self.risk_label.configure(text="这里只显示任务状态，不会授权或触发任何操作。")
         self.decision_state_label.configure(
             text=f"状态 · {self._codex_state_label(task.status)}"
         )
         self.detail_toggle_button.configure(state=tk.DISABLED, text="详细参数 ›")
         self.approve_button.set_state(tk.DISABLED)
+        self.stop_button.set_state(tk.DISABLED)
         self.reject_button.set_state(tk.DISABLED)
         self._set_detail(
             "\n".join(
@@ -3510,6 +4508,23 @@ class RelayWindow:
             reset_scroll=True,
         )
         self._detail_request_id = None
+        self._content_render_signature = render_signature
+
+    def _update_connection_status(self) -> None:
+        try:
+            server_open = self.server.socket.fileno() >= 0
+        except (AttributeError, OSError):
+            server_open = False
+        connector_seen = self.server.connector_snapshot() is not None
+        render_signature = (server_open, connector_seen)
+        if render_signature == self._connection_render_signature:
+            return
+        style_name, status_text = relay_connection_summary(
+            server_open=server_open,
+            connector_seen=connector_seen,
+        )
+        self.connection_label.configure(text=status_text, style=style_name)
+        self._connection_render_signature = render_signature
 
     def _update_inventory_and_restart(
         self,
@@ -3525,21 +4540,43 @@ class RelayWindow:
             if inventory.available
             else 0
         )
+        inventory_fresh = inventory.is_fresh()
+        restart_pending = self.store.restart_is_pending()
+        render_signature = (
+            inventory.available,
+            inventory.error_code,
+            inventory_fresh,
+            tuple((task.task_id, task.status, task.updated_at) for task in inventory.tasks),
+            pending_count,
+            running_count,
+            self._restart_in_progress,
+            restart_pending,
+        )
+        if render_signature == self._inventory_render_signature:
+            return
         if inventory.available:
             self.inventory_label.configure(
                 text=f"Codex 进行中 {active_codex} · 授权待确认 {pending_count} · 执行中 {running_count}"
             )
         elif inventory.error_code == "awaiting_thread_metadata":
-            self.inventory_label.configure(text="等待任一 Codex 任务连接金手指…")
+            self.inventory_label.configure(
+                text="等待任一 Codex 任务连接金手指 · 收到请求后会自动提醒"
+            )
         else:
-            self.inventory_label.configure(text="Codex 任务状态暂不可用 · 已禁止重启")
+            reason = inventory.error_code or "unknown"
+            self.inventory_label.configure(
+                text=f"Codex 任务状态暂不可用（{reason}）· 已禁止重启 · 请打开诊断"
+            )
 
         enabled = False
-        if self._restart_in_progress or self.store.restart_is_pending():
+        if self._restart_in_progress or restart_pending:
             restart_text = "正在执行安全重启…"
         elif not inventory.available:
-            restart_text = "任务清单不可用，保持禁用"
-        elif not inventory.is_fresh():
+            if inventory.error_code == "awaiting_thread_metadata":
+                restart_text = "等待 Codex 任务连接，保持禁用"
+            else:
+                restart_text = "任务清单不可用；打开诊断后重试"
+        elif not inventory_fresh:
             restart_text = "任务状态已过期，保持禁用"
         elif error_codex:
             restart_text = "任务清单含异常状态，保持禁用"
@@ -3552,18 +4589,33 @@ class RelayWindow:
             enabled = True
         self.restart_status_label.configure(text=restart_text)
         self.restart_button.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+        self._inventory_render_signature = render_signature
 
     def refresh(self) -> None:
         if self.closing:
             return
         self._refresh_theme()
+        self._update_connection_status()
         self.task_monitor.register_thread_ids(self.server.connector_thread_ids())
         inventory = self.task_monitor.snapshot()
-        rows = self.store.rows_for_gui()
-        incoming_request_ids = {str(row["request_id"]) for row in rows}
-        new_request_ids = incoming_request_ids - self._known_request_ids
-        self._known_request_ids = incoming_request_ids
-        self._request_rows = {str(row["request_id"]): row for row in rows}
+        self._inventory_available = inventory.available
+        self._inventory_error_code = inventory.error_code
+        (
+            store_revision,
+            changed_rows,
+            pending_count,
+            running_count,
+        ) = self.store.gui_snapshot(self._store_gui_revision)
+        self._store_gui_revision = store_revision
+        if changed_rows is not None:
+            rows = changed_rows
+            incoming_request_ids = {str(row["request_id"]) for row in rows}
+            new_request_ids = incoming_request_ids - self._known_request_ids
+            self._known_request_ids = incoming_request_ids
+            self._request_rows = {str(row["request_id"]): row for row in rows}
+        else:
+            rows = list(self._request_rows.values())
+            new_request_ids = set()
         self._codex_tasks = {task.task_id: task for task in inventory.tasks}
         self._refresh_task_tree()
 
@@ -3601,23 +4653,29 @@ class RelayWindow:
                 self.current_item_id = None
                 self._render_empty_state()
 
-        pending_count, running_count = self.store.active_counts()
         self._set_pending_attention(pending_count > 0)
         self._update_inventory_and_restart(
             inventory,
             pending_count=pending_count,
             running_count=running_count,
         )
-        self.status_label.configure(
-            text=f"待确认 {pending_count} · 执行中 {running_count} · 本地端口 {self.server.server_address[1]}"
+        status_text = (
+            f"待确认 {pending_count} · 执行中 {running_count} · "
+            f"本地端口 {self.server.server_address[1]}"
         )
+        if status_text != self._status_text:
+            self.status_label.configure(text=status_text)
+            self._status_text = status_text
         self.root.after(250, self.refresh)
 
     def on_select(self, _event: tk.Event[Any]) -> None:
         selected = self.tree.selection()
         if not selected:
             return
-        self._select_item(str(selected[0]))
+        item_id = str(selected[0])
+        if item_id == self.current_item_id:
+            return
+        self._select_item(item_id)
 
     def _on_detail_mousewheel(self, event: tk.Event[Any]) -> str | None:
         delta = int(getattr(event, "delta", 0))
@@ -3645,6 +4703,28 @@ class RelayWindow:
             return
         frozen = detail["frozen"]
         poll_policy = detail["poll_policy"]
+        remaining_seconds: int | None = None
+        if detail["state"] == "pending":
+            try:
+                expiry = datetime.fromisoformat(
+                    str(detail["expires_at"]).replace("Z", "+00:00")
+                )
+                remaining_seconds = max(0, int((expiry - utc_now()).total_seconds()))
+            except (TypeError, ValueError):
+                pass
+        render_signature = (
+            "request",
+            request_id,
+            detail["request_hash"],
+            detail["state"],
+            detail["updated_at"],
+            poll_policy["pending_polls_used"],
+            remaining_seconds,
+            self._detail_expanded,
+        )
+        if render_signature == self._content_render_signature:
+            return
+        self._set_decision_mode("request")
         source_project = self._one_line(
             frozen.get("source_project"), fallback="未标注项目", limit=46
         )
@@ -3776,24 +4856,28 @@ class RelayWindow:
 
         pending = detail["state"] == "pending"
         self.approve_button.set_state(tk.NORMAL if pending else tk.DISABLED)
+        self.stop_button.set_state(tk.NORMAL if pending else tk.DISABLED)
         self.reject_button.set_state(tk.NORMAL if pending else tk.DISABLED)
         state_text = self._state_label(str(detail["state"]))
         if pending:
-            try:
-                expiry = datetime.fromisoformat(
-                    str(detail["expires_at"]).replace("Z", "+00:00")
-                )
-                remaining = max(0, int((expiry - utc_now()).total_seconds()))
-                minutes, seconds = divmod(remaining, 60)
+            if remaining_seconds is not None:
+                minutes, seconds = divmod(remaining_seconds, 60)
                 state_text = (
                     f"待确认 · 剩余 {minutes:02d}:{seconds:02d} · "
                     f"轮询 {poll_policy['pending_polls_used']}/{poll_policy['max_pending_polls']}"
                 )
-            except (TypeError, ValueError):
+            else:
                 state_text = "待确认"
         elif detail["state"] == "running":
             state_text = "命令执行中 · 请勿关闭窗口"
+        elif (
+            detail["state"] == "cancelled"
+            and isinstance(detail.get("result"), dict)
+            and detail["result"].get("reason_code") == "stopped_by_user"
+        ):
+            state_text = "已停止 · 未同意，也未拒绝"
         self.decision_state_label.configure(text=state_text)
+        self._content_render_signature = render_signature
 
     def approve_selected(self) -> None:
         request_id = self.current_request_id
@@ -3814,6 +4898,17 @@ class RelayWindow:
             self.store.reject_from_gui(request_id)
         except RelayError as exc:
             messagebox.showerror("无法拒绝", exc.message, parent=self.root)
+        self._render_detail(request_id)
+        self.tree.focus_set()
+
+    def stop_selected(self) -> None:
+        request_id = self.current_request_id
+        if not request_id:
+            return
+        try:
+            self.store.cancel_from_gui(request_id)
+        except RelayError as exc:
+            messagebox.showerror("无法停止", exc.message, parent=self.root)
         self._render_detail(request_id)
         self.tree.focus_set()
 
@@ -3911,7 +5006,8 @@ class RelayWindow:
             try:
                 if existing.winfo_exists():
                     existing.lift()
-                    existing.focus_force()
+                    if self._diagnostic_text is not None:
+                        self._diagnostic_text.focus_set()
                     return
             except tk.TclError:
                 pass
@@ -3946,6 +5042,7 @@ class RelayWindow:
             foreground=self.palette.text,
             insertbackground=self.palette.text,
         )
+        self._diagnostic_text = text_widget
         scrollbar = ttk.Scrollbar(
             content,
             orient=tk.VERTICAL,
@@ -3970,26 +5067,43 @@ class RelayWindow:
             except tk.TclError:
                 pass
 
-        ttk.Button(
+        copy_button = ttk.Button(
             actions,
             text="复制诊断",
             command=copy_snapshot,
             style="Diag.HAR.TButton",
-        ).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(
+        )
+        copy_button.grid(row=0, column=1, padx=(0, 8))
+
+        def close_diagnostics(_event: tk.Event[Any] | None = None) -> str:
+            window.destroy()
+            return "break"
+
+        close_button = ttk.Button(
             actions,
             text="关闭",
-            command=window.destroy,
+            command=close_diagnostics,
             style="Diag.HAR.TButton",
-        ).grid(row=0, column=2)
+        )
+        close_button.grid(row=0, column=2)
 
-        def forget_window(_event: tk.Event[Any] | None = None) -> None:
+        def forget_window(event: tk.Event[Any] | None = None) -> None:
+            if event is not None and event.widget is not window:
+                return
             if self._diagnostic_window is window:
                 self._diagnostic_window = None
+                self._diagnostic_text = None
+                if not self.closing:
+                    try:
+                        self.diagnostics_button.focus_set()
+                    except tk.TclError:
+                        pass
 
         window.bind("<Destroy>", forget_window, add="+")
-        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        window.bind("<Escape>", close_diagnostics)
+        window.protocol("WM_DELETE_WINDOW", close_diagnostics)
         window.lift()
+        window.after_idle(copy_button.focus_set)
 
     def on_close(self) -> None:
         pending, running = self.store.active_counts()
@@ -4005,15 +5119,21 @@ class RelayWindow:
         self.closing = True
         self._restart_cancel.set()
         for job in (
-            self._policy_update_job,
             self._hit_shield_sync_job,
             self._activation_job,
+            self._decision_layout_job,
+            self._responsive_layout_job,
         ):
             if job is not None:
                 try:
                     self.root.after_cancel(job)
                 except tk.TclError:
                     pass
+        try:
+            if self.root.grab_current() is self.detail_panel:
+                self.detail_panel.grab_release()
+        except tk.TclError:
+            pass
         self._hide_hit_shield()
         self.task_monitor.stop()
         self.store.shutdown()

@@ -32,7 +32,7 @@ Creates one natural-language authorization card. A click returns the exact confi
 
 Required fields: \`exact_action\`, \`target\`, \`risk\`, \`recovery\`, \`idempotency_key\`, `source_label`, `source_project`, and `source_task`.
 
-The shipped window defaults produce a 3,600-second pending validity from `50 seconds × 72 polls`. The two window inputs are the only policy source and valid changes apply automatically to later requests. The broker freezes the current window policy when it creates the request and caps any shorter caller-supplied validity against that policy. A tool call may return \`pending\` before the validity ends; this is only a bounded poll result.
+The shipped policy fixes pending validity at 9,000 seconds from `900 seconds × 10 polls`. There are no mutable window polling inputs; legacy saved values are ignored. The broker freezes this policy when it creates the request and caps any shorter caller-supplied validity against it. A tool call may return \`pending\` before the validity ends; this is only a bounded poll result.
 
 ## request_command_execution
 
@@ -40,7 +40,7 @@ Creates one command card. Approval executes the frozen \`executable\` and \`argu
 
 Required fields: \`exact_action\`, \`executable\`, \`arguments\`, \`working_directory\`, \`target\`, \`risk\`, \`recovery\`, \`idempotency_key\`, `source_label`, `source_project`, and `source_task`.
 
-The shipped window defaults produce a 3,600-second pending validity and the same 3,600-second post-approval execution timeout. Both are derived from the poll duration multiplied by the pending-poll limit; there is no independent manual command-timeout field. The broker freezes the current window caps into each new request; explicit caller values may shorten but never exceed them.
+The shipped policy produces a 9,000-second pending validity and the same 9,000-second post-approval execution timeout. Both are derived from the fixed 900-second duration multiplied by the 10-poll limit; there is no independent manual command-timeout field. The broker freezes these caps into each new request; explicit caller values may shorten but never exceed them.
 
 Command eligibility is determined from the exact frozen executable, argument
 array, target, risk, recovery path, and applicable higher-priority rules. The
@@ -55,7 +55,7 @@ Reads or waits for the state of an existing request. It cannot approve a request
 
 Required fields: `request_id` and the matching `claim_token`. Active responses repeat both fields in `polling.next_arguments`; callers must reuse that object exactly. A missing or incorrect token returns `claim_mismatch` without disclosing another request's result.
 
-Zero performs an immediate read without consuming the count. Any positive wait uses the request's exact frozen `poll_policy.wait_seconds`, whose shipped default and hard per-call ceiling are 50 seconds. A \`pending\` or \`running\` result includes a structured polling directive with the exact next tool and arguments. Codex must follow that directive rather than keep a separate polling configuration. The broker does not proactively wake a completed Codex turn.
+Zero performs an immediate read without consuming the count. Any positive wait uses the request's exact frozen `poll_policy.wait_seconds`, fixed at 900 seconds. A \`pending\` or \`running\` result includes a structured polling directive with the exact next tool and arguments. Codex must follow that directive rather than keep a separate polling configuration. The broker does not proactively wake a completed Codex turn.
 
 Positive waits consume the frozen pending-poll budget only while the request remains \`pending\`; zero-wait reads do not. When the pending count or elapsed validity is exhausted before a click, the request becomes \`expired\`. Once a command is \`running\`, its separate frozen execution timeout remains authoritative so a monitoring counter never silently abandons or kills an approved process.
 
@@ -63,7 +63,9 @@ Positive waits consume the frozen pending-poll budget only while the request rem
 
 Cancels a pending request. It requires the matching `request_id` and `claim_token`. It does not revoke an already clicked approval and cannot reliably undo a process that has started.
 
-If Codex sends MCP `notifications/cancelled` for an active tool call, the synchronous connector can process it only after the current bounded broker wait returns (at most the frozen per-call wait, currently capped at 50 seconds). It then makes a best-effort cancellation of a still-pending card with the recorded claim. It never terminates an already approved command.
+If Codex sends MCP `notifications/cancelled` for an active tool call, the synchronous connector can process it only after the current 900-second broker wait returns. It then makes a best-effort cancellation of a still-pending card with the recorded claim. It never terminates an already approved command.
+
+The relay window's small **停止** control is the immediate request-side escape hatch. For a still-pending card it atomically sets `state=cancelled`, records `result.reason_code=stopped_by_user`, and notifies the Broker condition so an active wait returns immediately. It expresses neither approval nor rejection and is unavailable once a command is approved or running.
 
 ## State machine
 

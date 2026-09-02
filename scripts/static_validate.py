@@ -179,6 +179,10 @@ def validate_manifest() -> None:
         all("relay_broker" not in str(argument) for argument in args),
         "MCP configuration must not auto-launch the broker",
     )
+    require(
+        server.get("tool_timeout_sec") == 930,
+        "MCP tool timeout must cover one 900-second broker wait",
+    )
 
 
 def string_constants(tree: ast.AST) -> set[str]:
@@ -247,26 +251,54 @@ def validate_python_sources() -> None:
         "new_request_ids",
         'UI_SETTINGS_FILENAME = "ui-settings.json"',
         "WINDOW_MIN_WIDTH = 920",
+        "WINDOW_SNAP_MIN_WIDTH = 640",
+        "WINDOW_COMPACT_BREAKPOINT = 820",
+        "WINDOW_TOUCH_TARGET = 40",
         "WINDOW_MIN_HEIGHT = 600",
         "WINDOW_MIN_CONTENT_HEIGHT = 260",
         'root.rowconfigure(1, weight=1, minsize=WINDOW_MIN_CONTENT_HEIGHT)',
         'main.grid(row=1, column=0, sticky="nsew"',
-        "class CircularButton",
-        'text="进行中的任务"',
+        "class CircularButton(tk.Button)",
+        "_sync_native_accessible_name",
+        "EnableWindow",
+        "NotifyWinEvent",
+        "SetWindowSubclass",
+        "BUTTON_NATIVE_ACTIVE_DRAIN_MS = 100",
+        "BUTTON_NATIVE_IDLE_DRAIN_MS = 500",
+        "antialiased_circle_coverage",
+        "circular_button_visual_state",
+        "decision_button_layout",
+        "contrast_ratio",
+        "DECISION_LAYOUT_DEBOUNCE_MS = 80",
+        "tk.PhotoImage",
+        "Image.Resampling.LANCZOS",
+        "ImageFilter.GaussianBlur",
+        'self.bind("<Motion>", self._on_motion)',
+        'text="任务与请求"',
+        "Filter.HAR.TRadiobutton",
         'text="安全重启 Codex"',
         "detail_panel.grid_remove()",
-        "self.main.columnconfigure(2, weight=0, minsize=WINDOW_DETAIL_WIDTH)",
+        "responsive_window_layout",
+        "relay_connection_summary",
+        "empty_state_copy",
+        'columnspan=int(layout["detail_columnspan"])',
+        "RESPONSIVE_LAYOUT_DEBOUNCE_MS = 80",
+        "GUI_TERMINAL_HISTORY_LIMIT = 200",
+        "def gui_snapshot(",
+        "_next_expiry_check_monotonic",
         "self.approve_button.place",
+        "self.stop_button.place",
+        "if item_id == self.current_item_id:",
         "CodexTaskMonitor",
         "try_begin_codex_restart",
         "graceful_restart_codex",
         'task.status == "systemError"',
-        'text="次 = 总上限"',
         "_apply_safe_minimum_size",
         "winfo_reqheight",
         "获批命令将继承此权限",
-        'trace_add("write", self._schedule_policy_update)',
         "command_timeout_seconds = pending_wait_budget_seconds",
+        "cancel_from_gui",
+        '"reason_code": "stopped_by_user"',
         "_get_claimed_locked",
         "claim_fingerprint",
         "secrets.compare_digest",
@@ -461,7 +493,7 @@ def validate_python_sources() -> None:
     )
 
     protocol_source = load_utf8(PLUGIN_ROOT / "scripts" / "relay_protocol.py")
-    require("PROTOCOL_VERSION = 4" in protocol_source, "relay protocol version must be 4")
+    require("PROTOCOL_VERSION = 5" in protocol_source, "relay protocol version must be 5")
     require(
         'PACKAGE_VERSION = "0.2.0"' in protocol_source,
         "package version drifted",
@@ -490,12 +522,12 @@ def validate_python_sources() -> None:
         "legacy request ID prefix returned",
     )
     require(
-        "DEFAULT_APPROVAL_EXPIRY_SECONDS = 3_600" in protocol_source,
-        "approval validity must default to 60 minutes",
+        "DEFAULT_APPROVAL_EXPIRY_SECONDS = 9_000" in protocol_source,
+        "approval validity must default to 9,000 seconds",
     )
     require(
-        "DEFAULT_COMMAND_TIMEOUT_SECONDS = 3_600" in protocol_source,
-        "command timeout must default to 60 minutes",
+        "DEFAULT_COMMAND_TIMEOUT_SECONDS = 9_000" in protocol_source,
+        "command timeout must default to 9,000 seconds",
     )
     require(
         "MAX_APPROVAL_EXPIRY_SECONDS = 36_000" in protocol_source
@@ -503,13 +535,17 @@ def validate_python_sources() -> None:
         "window-configured pending and command bounds must stay capped at 10 hours",
     )
     require(
-        "DEFAULT_POLL_WAIT_SECONDS = 50" in protocol_source
-        and "DEFAULT_PENDING_POLL_CYCLES = 72" in protocol_source,
-        "window polling defaults must remain 50 seconds x 72 polls",
+        "MIN_POLL_WAIT_SECONDS = 900" in protocol_source
+        and "DEFAULT_POLL_WAIT_SECONDS = 900" in protocol_source
+        and "MAX_POLL_WAIT_SECONDS = 900" in protocol_source
+        and "MIN_PENDING_POLL_CYCLES = 10" in protocol_source
+        and "DEFAULT_PENDING_POLL_CYCLES = 10" in protocol_source
+        and "MAX_PENDING_POLL_CYCLES = 10" in protocol_source,
+        "polling policy must remain fixed at 900 seconds x 10 polls",
     )
     require(
-        "MIN_POLL_WAIT_SECONDS = 10" in protocol_source,
-        "single poll wait must have a 10-second lower bound",
+        "float(MAX_POLL_WAIT_SECONDS) + 5.0" in protocol_source,
+        "relay client socket timeout must cover one full fixed wait",
     )
     require(
         "MIN_APPROVAL_EXPIRY_SECONDS = 10" in protocol_source,
@@ -534,19 +570,21 @@ def validate_python_sources() -> None:
         "自动选中",
         "新请求提示音",
         "等待策略",
-        "自动应用",
         "不会穿透",
-        "只应用到随后创建的新请求",
+        "900 秒 × 10 次",
+        "停止",
         "920 × 600",
+        "640 × 600",
         "三列",
+        "覆盖层",
+        "UI Automation",
         "大圆形",
         "安全重启 Codex",
         "list_threads",
-        "极简公式",
         "权限横幅已移除",
         "claim_token",
         "认领指纹",
-        "协议版本 4",
+        "协议版本 5",
         "Job Object",
         "直接命名",
         "右上角“诊断”",
@@ -574,13 +612,21 @@ def validate_python_sources() -> None:
         "ignore_python_cache",
         "__pycache__",
         ".pyc",
+        "COLLECT(",
+        '"PIL.AvifImagePlugin"',
+        '"PIL.WebPImagePlugin"',
+        '"pyinstaller-shared-onedir"',
+        '"golden-finger.runtime"',
     ):
         require(marker in build_source, f"Windows release builder is missing {marker!r}")
+    require('"--onefile"' not in build_source, "Windows release builder reverted to onefile")
     for marker in (
         "sha256_file",
         "initialize",
         "--self-test-output",
         "job_object_active",
+        '"pyinstaller-shared-onedir"',
+        '"golden-finger.runtime"',
     ):
         require(marker in verify_source, f"Windows release verifier is missing {marker!r}")
     require(

@@ -164,18 +164,17 @@ COMMON_PROPERTIES: dict[str, Any] = {
         "maximum": MAX_APPROVAL_EXPIRY_SECONDS,
         "default": DEFAULT_APPROVAL_EXPIRY_SECONDS,
         "description": (
-            "Optional shorter pending validity. The relay window's saved pending-wait "
-            "budget is the authoritative cap for new requests."
+            "Optional shorter pending validity. The fixed 9,000-second relay policy "
+            "is the authoritative cap for new requests."
         ),
     },
     "wait_seconds": {
         "type": "integer",
-        "minimum": 0,
-        "maximum": MAX_POLL_WAIT_SECONDS,
+        "enum": [0, DEFAULT_POLL_WAIT_SECONDS],
         "default": DEFAULT_POLL_WAIT_SECONDS,
         "description": (
-            "Zero performs a read without consuming a pending poll. Any positive value "
-            "uses the window duration frozen for this request."
+            "Zero performs an immediate non-consuming read; 900 uses the fixed "
+            "per-request wait."
         ),
     },
     "idempotency_key": {
@@ -315,8 +314,8 @@ TOOLS: list[dict[str, Any]] = [
                     "maximum": MAX_COMMAND_TIMEOUT_SECONDS,
                     "default": DEFAULT_COMMAND_TIMEOUT_SECONDS,
                     "description": (
-                        "Optional shorter process timeout after approval. The relay window's "
-                        "saved command timeout is the authoritative cap for new requests."
+                        "Optional shorter process timeout after approval. The fixed "
+                        "9,000-second relay policy is the authoritative cap."
                     ),
                 },
             },
@@ -364,12 +363,11 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "wait_seconds": {
                     "type": "integer",
-                    "minimum": 0,
-                    "maximum": MAX_POLL_WAIT_SECONDS,
+                    "enum": [0, DEFAULT_POLL_WAIT_SECONDS],
                     "default": DEFAULT_POLL_WAIT_SECONDS,
                     "description": (
-                        "Zero reads immediately; any positive value uses the request's "
-                        "frozen per-call duration."
+                        "Zero reads immediately; 900 uses the request's fixed "
+                        "per-call duration."
                     ),
                 },
             },
@@ -536,7 +534,9 @@ def _bounded_wait(arguments: dict[str, Any]) -> int:
     wait = arguments.get("wait_seconds", DEFAULT_POLL_WAIT_SECONDS)
     if isinstance(wait, bool) or not isinstance(wait, int):
         raise RelayError("invalid_wait", "wait_seconds must be an integer.")
-    return max(0, min(wait, MAX_POLL_WAIT_SECONDS))
+    if wait < 0:
+        raise RelayError("invalid_wait", "wait_seconds must be zero or positive.")
+    return DEFAULT_POLL_WAIT_SECONDS if wait > 0 else 0
 
 
 def _polling_directive(

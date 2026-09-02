@@ -19,7 +19,7 @@
       "Non-click-through Codex-themed 60% acrylic window with fully opaque text",
       "Latest-request foreground and optional sound alerts",
       "Responsive minimum-size layout with a fixed approval bar",
-      "Compact live polling policy with an automatically derived total timeout",
+      "Fixed 900-second by 10-cycle polling with an immediate in-window stop",
       "Per-request capability claiming across concurrent projects",
       "Human-readable project/task origin labels plus a non-secret connector fingerprint",
       "Exact connector/Broker version and build handshake",

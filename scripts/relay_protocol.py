@@ -20,7 +20,7 @@ import tempfile
 from typing import Any
 
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 PACKAGE_VERSION = "0.2.0"
 PACKAGE_BUILD_ID = "source"
 PRODUCT_NAME = "GoldenFinger"
@@ -36,16 +36,16 @@ MAX_EXECUTABLE_BYTES = 1_073_741_824
 MAX_SCRIPT_BYTES = 67_108_864
 SCRIPT_EXTENSIONS = frozenset({".bat", ".cmd", ".ps1", ".py", ".pyw"})
 MIN_APPROVAL_EXPIRY_SECONDS = 10
-DEFAULT_APPROVAL_EXPIRY_SECONDS = 3_600
+DEFAULT_APPROVAL_EXPIRY_SECONDS = 9_000
 MAX_APPROVAL_EXPIRY_SECONDS = 36_000
-DEFAULT_COMMAND_TIMEOUT_SECONDS = 3_600
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 9_000
 MAX_COMMAND_TIMEOUT_SECONDS = 36_000
-MIN_POLL_WAIT_SECONDS = 10
-DEFAULT_POLL_WAIT_SECONDS = 50
-MAX_POLL_WAIT_SECONDS = 50
-MIN_PENDING_POLL_CYCLES = 1
-DEFAULT_PENDING_POLL_CYCLES = 72
-MAX_PENDING_POLL_CYCLES = 720
+MIN_POLL_WAIT_SECONDS = 900
+DEFAULT_POLL_WAIT_SECONDS = 900
+MAX_POLL_WAIT_SECONDS = 900
+MIN_PENDING_POLL_CYCLES = 10
+DEFAULT_PENDING_POLL_CYCLES = 10
+MAX_PENDING_POLL_CYCLES = 10
 TERMINAL_STATES = {
     "approved",
     "rejected",
@@ -817,7 +817,7 @@ class RelayClient:
         if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float)):
             wait_seconds = 0
         socket_timeout = (
-            min(float(MAX_POLL_WAIT_SECONDS) + 5.0, 60.0)
+            float(MAX_POLL_WAIT_SECONDS) + 5.0
             if operation == "wait" and float(wait_seconds) > 0
             else 3.0
         )
