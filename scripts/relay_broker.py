@@ -33,7 +33,7 @@ import unicodedata
 import zlib
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk
 
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageTk
@@ -93,6 +93,7 @@ WINDOW_COMPACT_BREAKPOINT = 820
 WINDOW_MIN_HEIGHT = 600
 WINDOW_MIN_CONTENT_HEIGHT = 260
 WINDOW_TOUCH_TARGET = 40
+WINDOW_DECISION_STAGE_MIN_HEIGHT = 168
 THEME_REFRESH_SECONDS = 2.0
 DECISION_LAYOUT_DEBOUNCE_MS = 80
 RESPONSIVE_LAYOUT_DEBOUNCE_MS = 80
@@ -263,13 +264,7 @@ def decision_button_layout(
 
     approve_x = max(0, (bounded_width - approve_size) // 2)
     approve_y = max(4, (bounded_height - approve_size) // 2)
-    auxiliary_y = max(
-        0,
-        min(
-            max(0, bounded_height - auxiliary_size),
-            approve_y + max(4, round(auxiliary_size * 0.10)),
-        ),
-    )
+    auxiliary_y = max(0, (bounded_height - auxiliary_size) // 2)
     stop_x = max(0, approve_x - auxiliary_size - gap)
     reject_x = min(
         max(0, bounded_width - auxiliary_size),
@@ -303,6 +298,43 @@ def responsive_window_layout(width: int) -> dict[str, Any]:
         "detail_column": 0,
         "detail_columnspan": 2,
     }
+
+
+def fit_summary_lines(
+    text: str,
+    *,
+    measure: Callable[[str], int],
+    width: int,
+    max_lines: int,
+) -> str:
+    """Fit a preview to measured lines; the frozen detail remains unabridged."""
+
+    remaining = " ".join(text.split())
+    lines: list[str] = []
+    available = max(1, width)
+    for line_index in range(max(1, max_lines)):
+        if not remaining:
+            break
+        if measure(remaining) <= available:
+            lines.append(remaining)
+            break
+        last_line = line_index == max(1, max_lines) - 1
+        suffix = "…" if last_line else ""
+        low, high = 0, len(remaining)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if measure(remaining[:middle].rstrip() + suffix) <= available:
+                low = middle
+            else:
+                high = middle - 1
+        cut = max(1, low)
+        if not last_line and remaining[cut : cut + 1] != " ":
+            boundary = remaining.rfind(" ", 0, cut)
+            if boundary >= cut // 2:
+                cut = boundary
+        lines.append(remaining[:cut].rstrip() + suffix)
+        remaining = remaining[cut:].lstrip()
+    return "\n".join(lines)
 
 
 def relay_connection_summary(
@@ -2730,6 +2762,104 @@ class RelayRequestHandler(socketserver.StreamRequestHandler):
             pass
 
 
+def _computer_use_version_key(version: str) -> tuple[int, ...] | None:
+    parts = version.split(".")
+    if not all(part.isascii() and part.isdecimal() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def _configured_computer_use_version(codex_home: Path) -> str | None:
+    """Read the bundled catalog's current version without inspecting sessions."""
+
+    try:
+        with (codex_home / "config.toml").open("rb") as handle:
+            config = tomllib.load(handle)
+        marketplaces = config.get("marketplaces", {})
+        bundled = (
+            marketplaces.get("openai-bundled", {})
+            if isinstance(marketplaces, dict)
+            else {}
+        )
+        if not isinstance(bundled, dict) or bundled.get("source_type") != "local":
+            return None
+        source = bundled.get("source")
+        if not isinstance(source, str) or not source.strip():
+            return None
+        marketplace_root = Path(source).expanduser()
+        if not marketplace_root.is_absolute():
+            marketplace_root = codex_home / marketplace_root
+        catalog = json.loads(
+            (marketplace_root / ".agents" / "plugins" / "marketplace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        entries = catalog.get("plugins", []) if isinstance(catalog, dict) else []
+        if not isinstance(entries, list):
+            return None
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("name") != "computer-use":
+                continue
+            plugin_source = entry.get("source", {})
+            if (
+                not isinstance(plugin_source, dict)
+                or plugin_source.get("source") != "local"
+            ):
+                continue
+            plugin_path = plugin_source.get("path")
+            if not isinstance(plugin_path, str) or not plugin_path.strip():
+                continue
+            manifest = json.loads(
+                (
+                    marketplace_root
+                    / plugin_path
+                    / ".codex-plugin"
+                    / "plugin.json"
+                ).read_text(encoding="utf-8")
+            )
+            if not isinstance(manifest, dict) or manifest.get("name") != "computer-use":
+                continue
+            version = manifest.get("version")
+            if isinstance(version, str) and _computer_use_version_key(version) is not None:
+                return version
+    except (OSError, UnicodeError, ValueError):
+        # A missing or stale catalog must not prevent opening an installed copy.
+        pass
+    return None
+
+
+def resolve_computer_use_guidance(codex_home: Path | None = None) -> Path:
+    """Resolve on every click so both the user profile and plugin version can change."""
+
+    if codex_home is None:
+        configured_home = os.environ.get("CODEX_HOME", "").strip()
+        codex_home = Path(configured_home) if configured_home else Path.home() / ".codex"
+    codex_home = codex_home.expanduser().resolve()
+    cache_root = codex_home / "plugins" / "cache" / "openai-bundled" / "computer-use"
+    configured_version = _configured_computer_use_version(codex_home)
+    if configured_version is not None:
+        current = cache_root / configured_version / "docs" / "guidance.md"
+        if current.is_file():
+            return current
+
+    candidates: list[tuple[tuple[int, ...], Path]] = []
+    if cache_root.is_dir():
+        for version_root in cache_root.iterdir():
+            version_key = _computer_use_version_key(version_root.name)
+            if version_key is None or not version_root.is_dir():
+                continue
+            guidance = version_root / "docs" / "guidance.md"
+            if guidance.is_file():
+                candidates.append((version_key, guidance))
+    if candidates:
+        return max(candidates, key=lambda item: item[0])[1]
+    raise FileNotFoundError(
+        "没有找到已安装 Computer Use 插件的 docs/guidance.md。\n\n"
+        f"查找目录：{cache_root}\n\n"
+        "请在 Codex 中安装或更新 Computer Use 插件后重试。"
+    )
+
+
 def collect_install_diagnostics(
     server: "RelayTCPServer | None" = None,
     *,
@@ -2987,6 +3117,10 @@ class RelayWindow:
         self._detail_expanded = False
         self._task_tree_signature: tuple[Any, ...] | None = None
         self._content_render_signature: tuple[Any, ...] | None = None
+        self._summary_values: tuple[str, str, str, str] | None = None
+        self._summary_signature: tuple[Any, ...] | None = None
+        self._summary_has_ellipsis = False
+        self._tree_empty_text: str | None = None
         self._inventory_render_signature: tuple[Any, ...] | None = None
         self._status_text: str | None = None
         self._task_filter = "active"
@@ -3149,7 +3283,7 @@ class RelayWindow:
     def _build_ui(self) -> None:
         header = ttk.Frame(
             self.root,
-            padding=(16, 12, 16, 10),
+            padding=(16, 12, 16, 12),
             style="HAR.TFrame",
         )
         self.header = header
@@ -3168,9 +3302,15 @@ class RelayWindow:
             style="ConnectionWaiting.HAR.TLabel",
         )
         self.connection_label.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.header_subtitle = ttk.Label(
+            header,
+            text="人机授权中继 · 停止仅结束等待，不代表同意或拒绝",
+            style="Subtitle.HAR.TLabel",
+        )
+        self.header_subtitle.pack(anchor=tk.W, pady=(4, 0))
         preferences = ttk.Frame(header, style="HAR.TFrame")
         self.preferences_row = preferences
-        preferences.pack(fill=tk.X, pady=(7, 0))
+        preferences.pack(fill=tk.X, pady=(8, 0))
         preferences.columnconfigure(0, weight=1)
         self.wait_policy_label = ttk.Label(
             preferences,
@@ -3196,24 +3336,29 @@ class RelayWindow:
             takefocus=True,
         )
         self.sound_toggle.grid(row=0, column=2, sticky="e")
+        self.computer_use_guidance_button = ttk.Button(
+            preferences,
+            text="编辑 Computer Use 指南",
+            command=self.open_computer_use_guidance,
+            style="Diag.HAR.TButton",
+            width=0,
+            takefocus=True,
+        )
+        self.computer_use_guidance_button.grid(
+            row=0, column=3, sticky="e", padx=(8, 0)
+        )
         self.diagnostics_button = ttk.Button(
             preferences,
             text="诊断",
             command=self.show_diagnostics,
             style="Diag.HAR.TButton",
+            width=0,
             takefocus=True,
         )
-        self.diagnostics_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
-        self.header_subtitle = ttk.Label(
-            header,
-            text="人机授权中继 · 停止仅结束等待，不代表同意或拒绝",
-            style="Subtitle.HAR.TLabel",
-        )
-        self.header_subtitle.pack(anchor=tk.W, pady=(3, 0))
-
+        self.diagnostics_button.grid(row=0, column=4, sticky="e", padx=(8, 0))
         main = ttk.Frame(
             self.root,
-            padding=(16, 0, 16, 14),
+            padding=(16, 0, 16, 16),
             style="HAR.TFrame",
         )
         self.main = main
@@ -3223,9 +3368,9 @@ class RelayWindow:
         main.columnconfigure(2, weight=0, minsize=0)
         main.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(main, padding=(14, 13), style="Card.HAR.TFrame")
+        left = ttk.Frame(main, padding=16, style="Card.HAR.TFrame")
         self.task_panel = left
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         left.columnconfigure(0, weight=1)
         left.rowconfigure(2, weight=1)
 
@@ -3266,7 +3411,7 @@ class RelayWindow:
             text="等待 Codex 任务状态…",
             style="CardMeta.HAR.TLabel",
         )
-        self.inventory_label.grid(row=1, column=0, sticky="ew", pady=(5, 8))
+        self.inventory_label.grid(row=1, column=0, sticky="ew", pady=(8, 12))
 
         tree_frame = ttk.Frame(left, style="Card.HAR.TFrame")
         tree_frame.grid(row=2, column=0, sticky="nsew")
@@ -3296,14 +3441,22 @@ class RelayWindow:
         self.tree.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.tree_empty_label = ttk.Label(
+            tree_frame,
+            text="",
+            style="CardMeta.HAR.TLabel",
+            justify=tk.CENTER,
+            anchor=tk.CENTER,
+            takefocus=False,
+        )
 
         restart_panel = ttk.Frame(
             left,
-            padding=(11, 10),
+            padding=12,
             style="Inset.HAR.TFrame",
         )
         self.restart_panel = restart_panel
-        restart_panel.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        restart_panel.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         restart_panel.columnconfigure(0, weight=1)
         self.restart_title_label = ttk.Label(
             restart_panel,
@@ -3318,7 +3471,7 @@ class RelayWindow:
             anchor=tk.W,
             justify=tk.LEFT,
         )
-        self.restart_status_label.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.restart_status_label.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self.restart_button = ttk.Button(
             restart_panel,
             text="安全重启 Codex",
@@ -3327,7 +3480,7 @@ class RelayWindow:
             state=tk.DISABLED,
             takefocus=True,
         )
-        self.restart_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(10, 0))
+        self.restart_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
         self.status_label = ttk.Label(
             left,
             text="等待请求…",
@@ -3335,11 +3488,11 @@ class RelayWindow:
         )
         self.status_label.grid(row=4, column=0, sticky="ew", pady=(8, 0))
 
-        center = ttk.Frame(main, padding=(16, 13), style="Card.HAR.TFrame")
+        center = ttk.Frame(main, padding=16, style="Card.HAR.TFrame")
         self.decision_panel = center
-        center.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        center.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         center.columnconfigure(0, weight=1)
-        center.rowconfigure(6, weight=1)
+        center.rowconfigure(6, weight=1, minsize=WINDOW_DECISION_STAGE_MIN_HEIGHT + 12)
         self.decision_heading_label = ttk.Label(
             center,
             text="授权确认",
@@ -3351,7 +3504,7 @@ class RelayWindow:
             text="尚未选择授权请求",
             style="CardMeta.HAR.TLabel",
         )
-        self.source_label.grid(row=1, column=0, sticky="ew", pady=(7, 0))
+        self.source_label.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         self.action_label = ttk.Label(
             center,
             text="等待一个明确、单次、可核对的动作",
@@ -3360,7 +3513,7 @@ class RelayWindow:
             justify=tk.LEFT,
             wraplength=310,
         )
-        self.action_label.grid(row=2, column=0, sticky="ew", pady=(5, 0))
+        self.action_label.grid(row=2, column=0, sticky="ew", pady=(4, 0))
         self.target_label = ttk.Label(
             center,
             text="",
@@ -3369,7 +3522,7 @@ class RelayWindow:
             justify=tk.LEFT,
             wraplength=310,
         )
-        self.target_label.grid(row=3, column=0, sticky="ew", pady=(7, 0))
+        self.target_label.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         self.risk_label = ttk.Label(
             center,
             text="",
@@ -3378,7 +3531,7 @@ class RelayWindow:
             justify=tk.LEFT,
             wraplength=310,
         )
-        self.risk_label.grid(row=4, column=0, sticky="ew", pady=(7, 0))
+        self.risk_label.grid(row=4, column=0, sticky="ew", pady=(4, 0))
         self.detail_toggle_button = ttk.Button(
             center,
             text="详细参数 ›",
@@ -3387,10 +3540,12 @@ class RelayWindow:
             state=tk.DISABLED,
             takefocus=True,
         )
-        self.detail_toggle_button.grid(row=5, column=0, sticky="w", pady=(9, 0))
+        self.detail_toggle_button.grid(row=5, column=0, sticky="w", pady=(8, 0))
 
-        self.decision_stage = ttk.Frame(center, style="Card.HAR.TFrame", height=250)
-        self.decision_stage.grid(row=6, column=0, sticky="nsew", pady=(6, 0))
+        self.decision_stage = ttk.Frame(
+            center, style="Card.HAR.TFrame", height=WINDOW_DECISION_STAGE_MIN_HEIGHT
+        )
+        self.decision_stage.grid(row=6, column=0, sticky="nsew", pady=(12, 0))
         self.decision_stage.grid_propagate(False)
         self.decision_stage.bind("<Configure>", self._schedule_decision_layout)
         self.stop_button = CircularButton(
@@ -3426,14 +3581,14 @@ class RelayWindow:
             style="DecisionState.HAR.TLabel",
             anchor=tk.CENTER,
         )
-        self.decision_state_label.grid(row=7, column=0, sticky="ew", pady=(3, 0))
+        self.decision_state_label.grid(row=7, column=0, sticky="ew", pady=(4, 0))
         self.guard_label = ttk.Label(
             center,
             text="仅授权当前冻结请求",
             style="Guard.HAR.TLabel",
             anchor=tk.CENTER,
         )
-        self.guard_label.grid(row=8, column=0, sticky="ew", pady=(3, 0))
+        self.guard_label.grid(row=8, column=0, sticky="ew", pady=(4, 0))
 
         detail_panel = ttk.Frame(main, padding=(14, 13), style="Card.HAR.TFrame")
         self.detail_panel = detail_panel
@@ -3497,7 +3652,8 @@ class RelayWindow:
         minimum_height = max(
             WINDOW_MIN_HEIGHT,
             self.header.winfo_reqheight()
-            + WINDOW_MIN_CONTENT_HEIGHT,
+            + self.decision_panel.winfo_reqheight()
+            + 16,
         )
         self.root.minsize(WINDOW_SNAP_MIN_WIDTH, minimum_height)
 
@@ -3568,7 +3724,7 @@ class RelayWindow:
                 column=1,
                 rowspan=2,
                 sticky="e",
-                padx=(10, 0),
+                padx=(12, 0),
                 pady=0,
             )
         else:
@@ -3583,16 +3739,26 @@ class RelayWindow:
                 pady=(8, 0),
             )
 
-        content_width = max(220, width - 48)
-        left_wrap = max(190, int(layout["left_minsize"]) - 36)
-        decision_wrap = max(190, int(layout["decision_minsize"]) - 36)
+        # Query the actual stretched cards, not their minimum widths. This also
+        # keeps previews accurate at intermediate sizes and with native fonts.
+        self.root.update_idletasks()
+        content_width = max(220, width - 32)
+        left_wrap = max(190, self.task_panel.winfo_width() - 32)
+        decision_wrap = max(190, self.decision_panel.winfo_width() - 32)
         self.header_subtitle.configure(wraplength=content_width)
         self.inventory_label.configure(wraplength=left_wrap)
-        self.restart_status_label.configure(wraplength=left_wrap)
+        restart_wrap = max(120, left_wrap - 24)
+        if not layout["compact"]:
+            restart_wrap = max(120, restart_wrap - self.restart_button.winfo_reqwidth() - 12)
+        self.restart_status_label.configure(wraplength=restart_wrap)
+        self.tree_empty_label.configure(wraplength=max(120, self.tree.winfo_width() - 24))
         self.source_label.configure(wraplength=decision_wrap)
         self.action_label.configure(wraplength=decision_wrap)
         self.target_label.configure(wraplength=decision_wrap)
         self.risk_label.configure(wraplength=decision_wrap)
+        self.guard_label.configure(wraplength=decision_wrap)
+        if self._fit_decision_summary():
+            self._content_render_signature = None
         if self._detail_expanded:
             self.detail_panel.grid_configure(
                 column=int(layout["detail_column"]),
@@ -3606,7 +3772,42 @@ class RelayWindow:
         # Recompute the ellipsized task title after the stretched Treeview
         # column settles at its new width.
         self._task_tree_signature = None
+        self._apply_safe_minimum_size()
         self._schedule_decision_layout()
+
+    def _set_decision_summary(
+        self, source: str, action: str, target: str = "", risk: str = ""
+    ) -> None:
+        self._summary_values = (source, action, target, risk)
+        if self._fit_decision_summary():
+            self._apply_safe_minimum_size()
+
+    def _fit_decision_summary(self) -> bool:
+        if self._summary_values is None:
+            return False
+        compact = responsive_window_layout(self.root.winfo_width())["compact"]
+        width = max(186, self.decision_panel.winfo_width() - 36)
+        labels = (self.source_label, self.action_label, self.target_label, self.risk_label)
+        fonts = tuple(self.style.lookup(str(label.cget("style")), "font") for label in labels)
+        signature = (width, compact, fonts, self._summary_values)
+        if signature == self._summary_signature:
+            return False
+        self._summary_has_ellipsis = False
+        for label, value, font_spec, line_count in zip(
+            labels, self._summary_values, fonts, (1, 2, 1 if compact else 2, 2)
+        ):
+            font = tkfont.Font(root=self.root, font=font_spec)
+            preview = fit_summary_lines(
+                value, measure=font.measure, width=width, max_lines=line_count
+            )
+            self._summary_has_ellipsis |= "…" in preview
+            label.configure(text=preview, wraplength=width)
+            if value:
+                label.grid()
+            else:
+                label.grid_remove()
+        self._summary_signature = signature
+        return True
 
     def _set_task_filter(self, value: str) -> None:
         if value not in {"active", "all"}:
@@ -3738,7 +3939,7 @@ class RelayWindow:
             "Subtitle.HAR.TLabel",
             background=window_background,
             foreground=palette.muted,
-            font=("Microsoft YaHei UI", 10),
+            font=("Microsoft YaHei UI", 9),
         )
         style.configure(
             "Meta.HAR.TLabel",
@@ -3895,7 +4096,7 @@ class RelayWindow:
             font=("Microsoft YaHei UI", 9),
             focuscolor=palette.accent,
             indicatorcolor=palette.surface_alt,
-            padding=(8, 12),
+            padding=(8, 10, 8, 11),
         )
         style.map(
             "HAR.TCheckbutton",
@@ -3915,7 +4116,7 @@ class RelayWindow:
             darkcolor=palette.border,
             focuscolor=palette.accent,
             font=("Microsoft YaHei UI", 9),
-            padding=(12, 12),
+            padding=(12, 8, 12, 9),
             relief=tk.FLAT,
         )
         for button_style, background, foreground in (
@@ -3931,7 +4132,7 @@ class RelayWindow:
                 darkcolor=background,
                 focuscolor=palette.accent,
                 font=("Microsoft YaHei UI", 9),
-                padding=(10, 12),
+                padding=(8, 8, 8, 9),
                 relief=tk.FLAT,
             )
             style.map(
@@ -3949,7 +4150,7 @@ class RelayWindow:
             focuscolor=palette.accent,
             indicatorcolor=palette.surface,
             font=("Microsoft YaHei UI", 9),
-            padding=(10, 12),
+            padding=(8, 10, 8, 11),
             relief=tk.FLAT,
         )
         style.map(
@@ -3979,7 +4180,7 @@ class RelayWindow:
             darkcolor=palette.accent,
             focuscolor=palette.text,
             font=("Microsoft YaHei UI", 9, "bold"),
-            padding=(12, 12),
+            padding=(12, 8, 12, 9),
             relief=tk.FLAT,
         )
         style.map(
@@ -3997,7 +4198,10 @@ class RelayWindow:
                 ("pressed", palette.accent_pressed),
                 ("active", palette.secondary_hover),
             ],
-            foreground=[("disabled", palette.disabled_text)],
+            foreground=[
+                ("disabled", palette.disabled_text),
+                ("pressed", palette.accent_text),
+            ],
         )
         style.configure(
             "HAR.Treeview",
@@ -4367,6 +4571,19 @@ class RelayWindow:
             )
 
         entries_signature = tuple(entries)
+        empty_text = (
+            "当前筛选无结果\n切换“全部”查看历史"
+            if self._task_filter == "active" and (self._request_rows or self._codex_tasks)
+            else "暂无任务或授权请求\n收到请求后会出现在这里"
+        )
+        if entries:
+            if self._tree_empty_text is not None:
+                self.tree_empty_label.place_forget()
+                self._tree_empty_text = None
+        elif self._tree_empty_text != empty_text:
+            self.tree_empty_label.configure(text=empty_text)
+            self.tree_empty_label.place(in_=self.tree, relx=0.5, rely=0.5, anchor=tk.CENTER)
+            self._tree_empty_text = empty_text
         if entries_signature == self._task_tree_signature:
             return
 
@@ -4415,23 +4632,27 @@ class RelayWindow:
             self._render_codex_task(item_id.removeprefix("codex:"))
 
     def _set_decision_mode(self, mode: str) -> None:
+        # Stable controls preserve the approval UI's spatial memory. Renderers
+        # keep them disabled unless a pending frozen request is selected.
+        if mode in {"empty", "task"}:
+            self.current_request_id = None
+            for button in (self.stop_button, self.approve_button, self.reject_button):
+                button.set_state(tk.DISABLED)
+        self.decision_stage.grid()
+        self._schedule_decision_layout()
         if mode == "task":
             if self._detail_expanded:
                 self._set_detail_expanded(False)
             self.decision_heading_label.configure(text="任务详情")
-            self.decision_stage.grid_remove()
             self.guard_label.configure(text="仅用于安全重启判断，不会执行操作")
             return
         if mode == "empty":
             if self._detail_expanded:
                 self._set_detail_expanded(False)
             self.decision_heading_label.configure(text="等待授权请求")
-            self.decision_stage.grid_remove()
             self.guard_label.configure(text="收到请求后会显示可核对的单次动作")
             return
         self.decision_heading_label.configure(text="授权确认")
-        self.decision_stage.grid()
-        self._schedule_decision_layout()
         self.guard_label.configure(text="仅授权当前冻结请求")
 
     def _render_empty_state(self) -> None:
@@ -4453,10 +4674,7 @@ class RelayWindow:
             inventory_available=self._inventory_available,
             inventory_error_code=self._inventory_error_code,
         )
-        self.source_label.configure(text=source_text)
-        self.action_label.configure(text=action_text)
-        self.target_label.configure(text="")
-        self.risk_label.configure(text="")
+        self._set_decision_summary(source_text, action_text)
         self.decision_state_label.configure(text=state_text)
         self.detail_toggle_button.configure(state=tk.DISABLED, text="详细参数 ›")
         self.approve_button.set_state(tk.DISABLED)
@@ -4483,10 +4701,11 @@ class RelayWindow:
         if render_signature == self._content_render_signature:
             return
         self._set_decision_mode("task")
-        self.source_label.configure(text="只读 Codex 任务")
-        self.action_label.configure(text=task.title)
-        self.target_label.configure(text=f"项目 · {self._compact_source(task.cwd)}")
-        self.risk_label.configure(text="这里只显示任务状态，不会授权或触发任何操作。")
+        self._set_decision_summary(
+            "只读 Codex 任务", task.title,
+            f"项目 · {self._compact_source(task.cwd)}",
+            "这里只显示任务状态，不会授权或触发任何操作。",
+        )
         self.decision_state_label.configure(
             text=f"状态 · {self._codex_state_label(task.status)}"
         )
@@ -4731,26 +4950,21 @@ class RelayWindow:
         source_task = self._one_line(
             frozen.get("source_task"), fallback="未标注任务", limit=46
         )
-        self.source_label.configure(text=f"{source_project} · {source_task}")
-        self.action_label.configure(
-            text=self._one_line(frozen.get("exact_action"), fallback="授权请求", limit=140)
-        )
-        self.target_label.configure(
-            text="目标 · "
-            + self._one_line(frozen.get("target"), fallback="未标注", limit=120)
-        )
-        self.risk_label.configure(
-            text="风险 · "
-            + self._one_line(frozen.get("risk"), fallback="未标注", limit=110)
+        self._set_decision_summary(
+            f"{source_project} · {source_task}",
+            self._one_line(frozen.get("exact_action"), fallback="授权请求", limit=140),
+            "目标 · " + self._one_line(frozen.get("target"), fallback="未标注", limit=120),
+            "风险 · " + self._one_line(frozen.get("risk"), fallback="未标注", limit=110),
         )
         parameter_count = 6
         if frozen.get("kind") == "command":
             arguments = frozen.get("arguments")
             parameter_count = 8 + (len(arguments) if isinstance(arguments, list) else 0)
         marker = "‹" if self._detail_expanded else "›"
+        preview_hint = " · 含省略" if self._summary_has_ellipsis else ""
         self.detail_toggle_button.configure(
             state=tk.NORMAL,
-            text=f"详细参数 {parameter_count}项 {marker}",
+            text=f"详细参数 {parameter_count}项{preview_hint} {marker}",
         )
         reset_scroll = request_id != self._detail_request_id
         permission_line = execution_mode_label(
@@ -4999,6 +5213,24 @@ class RelayWindow:
         else:
             self.restart_status_label.configure(text=result.message)
             messagebox.showwarning("未执行重启", result.message, parent=self.root)
+
+    def open_computer_use_guidance(self) -> None:
+        try:
+            guidance = resolve_computer_use_guidance()
+        except OSError as exc:
+            messagebox.showerror("无法找到 Computer Use 指南", str(exc), parent=self.root)
+            return
+        try:
+            # Default ShellExecute verb honors the user's .md file association.
+            os.startfile(str(guidance))
+        except OSError as exc:
+            messagebox.showerror(
+                "无法打开 Computer Use 指南",
+                f"文件：{guidance}\n\n"
+                "请检查文件权限，并为 .md 文件设置默认打开软件后重试。\n\n"
+                f"系统提示：{exc}",
+                parent=self.root,
+            )
 
     def show_diagnostics(self) -> None:
         existing = self._diagnostic_window

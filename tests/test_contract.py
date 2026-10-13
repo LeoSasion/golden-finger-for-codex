@@ -1,13 +1,14 @@
 """External-only unit tests for Golden Finger for Codex.
 
 Run these from a user-controlled terminal. They do not launch Codex or any
-user-visible GUI. On Windows, one hidden Tk control verifies native button
+user-visible GUI. On Windows, hidden Tk controls verify native button
 semantics and one bounded Python child verifies Job Object termination.
 """
 
 from __future__ import annotations
 
 import ctypes
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from tkinter import ttk
 import unittest
 from unittest.mock import patch
 
@@ -47,12 +49,14 @@ from relay_broker import (
     ellipsize_display_text,
     empty_state_copy,
     execution_mode_label,
+    fit_summary_lines,
     format_install_diagnostics,
     load_ui_settings,
     normalize_poll_policy,
     read_codex_theme_preference,
     relay_connection_summary,
     responsive_window_layout,
+    resolve_computer_use_guidance,
     resolve_theme,
     safe_transparent_client,
     save_ui_settings,
@@ -61,6 +65,7 @@ from relay_broker import (
 from codex_lifecycle import (
     APP_TOOLS_SCHEMA_VERSION,
     CodexLifecycleError,
+    CodexTask,
     CodexTaskInventory,
     CodexTaskMonitor,
     extract_codex_thread_id,
@@ -847,7 +852,286 @@ class StoreTests(unittest.TestCase):
         self.assertEqual((pending, running), (1, 0))
 
 
+class ComputerUseGuidanceTests(unittest.TestCase):
+    @staticmethod
+    def write_guidance(codex_home: Path, version: str) -> Path:
+        path = (
+            codex_home / "plugins" / "cache" / "openai-bundled"
+            / "computer-use" / version / "docs" / "guidance.md"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Test guidance\n", encoding="utf-8")
+        return path.resolve()
+
+    @staticmethod
+    def write_catalog(codex_home: Path, version: str) -> Path:
+        source = codex_home / "bundled marketplace"
+        catalog = source / ".agents" / "plugins" / "marketplace.json"
+        catalog.parent.mkdir(parents=True, exist_ok=True)
+        catalog.write_text(
+            json.dumps({"plugins": [{
+                "name": "computer-use",
+                "source": {"source": "local", "path": "./plugins/computer-use"},
+            }]}),
+            encoding="utf-8",
+        )
+        manifest = source / "plugins" / "computer-use" / ".codex-plugin" / "plugin.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps({"name": "computer-use", "version": version}),
+            encoding="utf-8",
+        )
+        (codex_home / "config.toml").write_text(
+            "[marketplaces.openai-bundled]\nsource_type = 'local'\n"
+            f"source = {json.dumps(str(source))}\n",
+            encoding="utf-8",
+        )
+        return catalog
+
+    def test_resolver_honors_custom_codex_home_with_spaces_and_unicode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            home = Path(temp_root) / "另一用户" / "custom codex home"
+            expected = self.write_guidance(home, "27.123.456")
+            with patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+                self.assertEqual(resolve_computer_use_guidance(), expected.resolve())
+
+    def test_resolver_defaults_to_the_current_users_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            profile = Path(temp_root) / "different-user"
+            expected = self.write_guidance(profile / ".codex", "27.1.2")
+            with patch.dict(os.environ, {"CODEX_HOME": ""}), patch(
+                "relay_broker.Path.home", return_value=profile
+            ):
+                self.assertEqual(resolve_computer_use_guidance(), expected.resolve())
+
+    def test_resolver_compares_versions_numerically_and_skips_incomplete_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            home = Path(temp_root)
+            self.write_guidance(home, "26.9.999")
+            expected = self.write_guidance(home, "26.10.1")
+            self.write_guidance(home, "latest")
+            (expected.parents[2] / "26.99.1" / "docs").mkdir(parents=True)
+            self.assertEqual(resolve_computer_use_guidance(home), expected)
+
+    def test_current_catalog_version_wins_over_newer_leftover_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            home = Path(temp_root)
+            expected = self.write_guidance(home, "26.10.1")
+            self.write_guidance(home, "27.1.1")
+            self.write_catalog(home, "26.10.1")
+            self.assertEqual(resolve_computer_use_guidance(home), expected)
+
+    def test_missing_current_version_falls_back_to_an_installed_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            home = Path(temp_root)
+            expected = self.write_guidance(home, "26.10.1")
+            self.write_catalog(home, "27.1.1")
+            self.assertEqual(resolve_computer_use_guidance(home), expected)
+
+    def test_broken_catalog_and_config_do_not_hide_installed_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            home = Path(temp_root)
+            expected = self.write_guidance(home, "26.10.1")
+            catalog = self.write_catalog(home, "26.10.1")
+            catalog.write_text("broken JSON", encoding="utf-8")
+            self.assertEqual(resolve_computer_use_guidance(home), expected)
+            (home / "config.toml").write_text("[broken TOML", encoding="utf-8")
+            self.assertEqual(resolve_computer_use_guidance(home), expected)
+
+    def test_catalog_version_cannot_escape_the_plugin_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            home = Path(temp_root)
+            expected = self.write_guidance(home, "26.10.1")
+            self.write_catalog(home, "../../some-other-directory")
+            self.assertEqual(resolve_computer_use_guidance(home), expected)
+
+    def test_resolver_observes_new_versions_on_later_clicks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            home = Path(temp_root)
+            older = self.write_guidance(home, "26.10.1")
+            self.assertEqual(resolve_computer_use_guidance(home), older)
+            newer = self.write_guidance(home, "27.1.1")
+            self.assertEqual(resolve_computer_use_guidance(home), newer)
+
+    def test_missing_guidance_explains_where_to_check_and_how_to_recover(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            home = Path(temp_root)
+            with self.assertRaises(FileNotFoundError) as raised:
+                resolve_computer_use_guidance(home)
+            self.assertIn(str(home.resolve() / "plugins" / "cache"), str(raised.exception))
+            self.assertIn("安装或更新", str(raised.exception))
+
+    def test_button_reresolves_and_uses_the_system_default_open_verb(self) -> None:
+        window = RelayWindow.__new__(RelayWindow)
+        window.root = object()
+        paths = [Path("C:/user-one/guide.md"), Path("D:/codex-home/guide.md")]
+        with patch("relay_broker.resolve_computer_use_guidance", side_effect=paths) as resolve, patch(
+            "relay_broker.os.startfile", create=True
+        ) as startfile:
+            window.open_computer_use_guidance()
+            window.open_computer_use_guidance()
+        self.assertEqual(resolve.call_count, 2)
+        self.assertEqual(startfile.call_args_list[0].args, (str(paths[0]),))
+        self.assertEqual(startfile.call_args_list[1].args, (str(paths[1]),))
+        self.assertEqual(startfile.call_args_list[0].kwargs, {})
+
+    def test_button_reports_missing_files_without_launching_an_app(self) -> None:
+        window = RelayWindow.__new__(RelayWindow)
+        window.root = object()
+        with patch(
+            "relay_broker.resolve_computer_use_guidance",
+            side_effect=FileNotFoundError("请安装或更新 Computer Use 插件"),
+        ), patch("relay_broker.os.startfile", create=True) as startfile, patch(
+            "relay_broker.messagebox.showerror"
+        ) as showerror:
+            window.open_computer_use_guidance()
+        startfile.assert_not_called()
+        self.assertIn("安装或更新", showerror.call_args.args[1])
+        self.assertIs(showerror.call_args.kwargs["parent"], window.root)
+
+    def test_button_reports_default_app_failures_with_recovery_advice(self) -> None:
+        window = RelayWindow.__new__(RelayWindow)
+        window.root = object()
+        guidance = Path("C:/some-user/guidance.md")
+        with patch(
+            "relay_broker.resolve_computer_use_guidance", return_value=guidance
+        ), patch(
+            "relay_broker.os.startfile", create=True,
+            side_effect=OSError("No application is associated with this file"),
+        ), patch("relay_broker.messagebox.showerror") as showerror:
+            window.open_computer_use_guidance()
+        self.assertIn(str(guidance), showerror.call_args.args[1])
+        self.assertIn("默认打开软件", showerror.call_args.args[1])
+
+
 class AppearanceTests(unittest.TestCase):
+    @staticmethod
+    @contextmanager
+    def hidden_relay():
+        root = tk.Tk()
+        root.withdraw()
+        store = RequestStore(elevated=False)
+        server = RelayTCPServer(
+            ("127.0.0.1", 0), RelayRequestHandler, token="layout-test", store=store
+        )
+        with patch("relay_broker.CodexTaskMonitor.start"), patch(
+            "relay_broker.apply_native_window_appearance", return_value=False
+        ), patch("relay_broker.read_codex_theme_preference", return_value="light"):
+            try:
+                window = RelayWindow(
+                    root, store=store, server=server, token="layout-test",
+                    settings={"sound_enabled": False},
+                )
+                yield window
+            finally:
+                window.closing = True
+                window.task_monitor.stop()
+                server.server_close()
+                for job in root.tk.call("after", "info"):
+                    root.after_cancel(job)
+                root.destroy()
+
+    def test_summary_line_budget_preserves_short_copy_and_marks_long_copy(self) -> None:
+        self.assertEqual(
+            fit_summary_lines("  一次  操作  ", measure=len, width=20, max_lines=2),
+            "一次 操作",
+        )
+        for width in (12, 20, 30):
+            preview = fit_summary_lines(
+                "请核对这个很长的单次动作和 exact frozen target before approval。" * 3,
+                measure=len, width=width, max_lines=2,
+            )
+            self.assertLessEqual(len(preview.splitlines()), 2)
+            self.assertTrue(preview.endswith("…"))
+            self.assertTrue(all(len(line) <= width for line in preview.splitlines()))
+        self.assertEqual(fit_summary_lines("", measure=len, width=20, max_lines=2), "")
+
+    def test_summary_uses_actual_native_font_measure(self) -> None:
+        from tkinter import font as tkfont
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            font = tkfont.Font(root=root, family="Microsoft YaHei UI", size=13, weight="bold")
+            preview = fit_summary_lines(
+                "执行一次可核对的 Golden Finger 界面检查并保留完整冻结参数。" * 4,
+                measure=font.measure, width=240, max_lines=2,
+            )
+            self.assertEqual(len(preview.splitlines()), 2)
+            self.assertTrue(preview.endswith("…"))
+            self.assertTrue(all(font.measure(line) <= 240 for line in preview.splitlines()))
+        finally:
+            root.destroy()
+
+    def test_empty_and_read_only_modes_keep_disabled_native_controls(self) -> None:
+        with self.hidden_relay() as window:
+            for mode in ("empty", "task"):
+                window.current_request_id = "stale-selection"
+                for button in (window.stop_button, window.approve_button, window.reject_button):
+                    button.set_state(tk.NORMAL)
+                window._set_decision_mode(mode)
+                self.assertEqual(window.decision_stage.winfo_manager(), "grid")
+                self.assertIsNone(window.current_request_id)
+                for button in (window.stop_button, window.approve_button, window.reject_button):
+                    self.assertFalse(button._enabled)
+                    with patch.object(window.store, "approve_from_gui") as approve:
+                        button._native_invoke_pending = True
+                        button._drain_native_invoke()
+                        approve.assert_not_called()
+                with patch.object(window.store, "approve_from_gui") as approve:
+                    window.approve_selected()
+                    approve.assert_not_called()
+
+    def test_request_preview_does_not_truncate_frozen_details(self) -> None:
+        with self.hidden_relay() as window:
+            action = "仅用于界面布局测试，不执行任何命令。" * 12
+            target = "布局测试的长目标路径/" * 15
+            risk = "仅提交模拟文本，不控制 Codex 或其他程序。" * 12
+            snapshot, _replay, _claim = window.store.submit("consent", {
+                "exact_action": action, "target": target, "risk": risk,
+                "recovery": "关闭测试窗口即可。", "approved_reply": "模拟回复",
+                "idempotency_key": "layout-preview-test",
+            }, CLIENT_A)
+            window.current_request_id = snapshot["request_id"]
+            window._render_detail(snapshot["request_id"])
+            self.assertTrue(window._summary_has_ellipsis)
+            self.assertIn("含省略", window.detail_toggle_button.cget("text"))
+            self.assertIn(action, window._detail_text)
+            self.assertIn(target, window._detail_text)
+            self.assertIn(risk, window._detail_text)
+            self.assertEqual(window.decision_stage.winfo_manager(), "grid")
+            self.assertTrue(window.approve_button._enabled)
+            self.assertEqual(window.store.detail_for_gui(snapshot["request_id"])["state"], "pending")
+
+    def test_empty_tree_prompt_is_not_a_synthetic_task_row(self) -> None:
+        with self.hidden_relay() as window:
+            self.assertFalse(window.tree.get_children())
+            self.assertEqual(window.tree_empty_label.winfo_manager(), "place")
+            self.assertIn("暂无", window.tree_empty_label.cget("text"))
+            window._request_rows = {"ended": {
+                "request_id": "ended", "state": "cancelled", "exact_action": "已结束模拟请求",
+            }}
+            window._refresh_task_tree()
+            self.assertIn("筛选无结果", window.tree_empty_label.cget("text"))
+            window._set_task_filter("all")
+            self.assertEqual(len(window.tree.get_children()), 1)
+            self.assertEqual(window.tree_empty_label.winfo_manager(), "")
+
+    def test_read_only_task_render_cannot_reuse_a_previous_request_selection(self) -> None:
+        with self.hidden_relay() as window:
+            task = CodexTask(
+                task_id=THREAD_A, title="模拟只读任务", status="active", cwd="C:/layout-test",
+                kind="codex", updated_at=1.0,
+            )
+            window._codex_tasks = {task.task_id: task}
+            window.current_request_id = "previous-request"
+            window._render_codex_task(task.task_id)
+            self.assertEqual(window.decision_stage.winfo_manager(), "grid")
+            self.assertIsNone(window.current_request_id)
+            self.assertFalse(window.approve_button._enabled)
+            self.assertFalse(window.stop_button._enabled)
+            self.assertFalse(window.reject_button._enabled)
+            self.assertIn("只读", window.source_label.cget("text"))
+
     def test_window_baseline_keeps_fixed_chrome_visible(self) -> None:
         self.assertGreaterEqual(WINDOW_MIN_WIDTH, 920)
         self.assertGreaterEqual(WINDOW_MIN_HEIGHT, 600)
@@ -988,6 +1272,15 @@ class AppearanceTests(unittest.TestCase):
             decision_button_layout(313, 250)["approve"][2],
         )
 
+    def test_decision_controls_share_a_centerline_and_keep_snap_primary_prominent(self) -> None:
+        for width, height in ((250, 168), (264, 180), (360, 250), (600, 420)):
+            layout = decision_button_layout(width, height)
+            centerlines = [y + size / 2 for _x, y, size in layout.values()]
+            self.assertLessEqual(max(centerlines) - min(centerlines), 1)
+            self.assertGreaterEqual(layout["approve"][2], 138)
+            self.assertGreaterEqual(layout["stop"][2], 40)
+            self.assertGreaterEqual(layout["reject"][2], 40)
+
     def test_tree_titles_use_width_aware_ellipsis_for_mixed_text(self) -> None:
         title = "在当前项目中执行一次受限的 Windows 发布前验证"
         compact = ellipsize_display_text(title, max_units=12)
@@ -1020,6 +1313,32 @@ class AppearanceTests(unittest.TestCase):
                 contrast_ratio(palette.selection, palette.selection_text),
                 4.5,
             )
+
+    @unittest.skipUnless(os.name == "nt", "Native ttk styles are Windows-only")
+    def test_toolbar_button_style_preserves_label_contrast_when_pressed(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            window = RelayWindow.__new__(RelayWindow)
+            window.style = ttk.Style(root)
+            window.style.theme_use("clam")
+            for theme, palette in THEME_PALETTES.items():
+                window._configure_styles(palette, window_background=palette.window)
+                for state in ((), ("active",), ("pressed",), ("active", "pressed")):
+                    with self.subTest(theme=theme, state=state):
+                        foreground = str(window.style.lookup(
+                            "Diag.HAR.TButton", "foreground", state
+                        ))
+                        background = str(window.style.lookup(
+                            "Diag.HAR.TButton", "background", state
+                        ))
+                        self.assertGreaterEqual(contrast_ratio(background, foreground), 4.5)
+                self.assertEqual(
+                    window.style.lookup("Diag.HAR.TButton", "foreground", ("pressed",)),
+                    palette.accent_text,
+                )
+        finally:
+            root.destroy()
 
     def test_tree_selection_handler_does_not_self_trigger(self) -> None:
         class FakeTree:

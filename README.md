@@ -64,9 +64,13 @@ Codex金手指不是在后台逐字监听聊天文本，也没有一份 Broker �
 
 每次检测到新请求只提醒一次：列表自动按最新优先重排、自动选中最新项并滚入视野；若窗口已最小化则恢复，并在仍有待确认请求期间保持置顶。新请求只触发一次 Windows 前台激活尝试，键盘焦点落在非操作性的请求列表，不会把 Enter 或空格预设为批准；250 ms 刷新也不会再清除正在按下的按钮状态。最后一个待确认请求处理后会自动取消置顶。
 
+空闲、筛选无结果和只读任务状态也保留三颗圆形按钮，但全部禁用并清除授权请求选择；只有选中了待确认的冻结请求才会启用。主按钮与两颗辅助按钮共用水平中心线，按钮区保留至少 168px 高度，避免长文字把圆形控件挤成小点。外部留白与卡片内边距统一为 16px，分组间隔采用 4 / 8 / 12 / 16px 节奏；顶部工具保持至少 40px 命中高度。摘要按实际栏宽和系统字体测量换行，动作与风险最多显示两行，窄窗目标显示一行，省略时“详细参数”会标注“含省略”；冻结的完整动作、目标、风险与恢复路径不会裁剪，仍可在详情覆盖层核对。长内容或字体缩放需要额外高度时，窗口会提高安全高度下限。空列表提示独立于真实任务行，收到任务或请求后自动移除。
+
 “新请求提示音”默认开启，可在窗口右上角随时关闭或重新开启。选择只保存到中继自己的 `ui-settings.json`，不会修改 Codex 或 Windows 设置；重复轮询同一请求不会再次发声。
 
 右上角“诊断”会打开可滚动、可复制的只读安装快照：Broker/连接器版本与精确 build ID、协议号、源码或自包含运行模式、权限、Job Object 能力、插件启用状态、版本化缓存、快捷方式及最近连接器指纹。快照明确脱敏，不包含端点 bearer secret、`claim_token`、原始连接器实例 ID、请求正文或命令输出。它不调用或控制 Codex，也不会自动修复、安装或切换版本。
+
+顶部“编辑 Computer Use 指南”会用 Windows 为 `.md` 文件配置的默认软件打开插件的 `docs/guidance.md`。每次点击都重新定位：优先使用 `CODEX_HOME`，未设置时使用当前用户的 `~/.codex`；优先匹配当前本地 `openai-bundled` 插件清单中的版本，清单不可用时按数值版本号选择缓存中实际包含指南的最新版本，不写死用户名或版本号。未安装插件、找不到文件或默认软件无法打开时会给出错误与处理建议。该按钮不修改指南内容；插件升级可能覆盖用户对缓存文件的编辑。
 
 ## 轮询与执行设置
 
@@ -83,6 +87,30 @@ Codex金手指不是在后台逐字监听聊天文本，也没有一份 Broker �
     python scripts\relay_broker.py
 
 本仓库没有自动安装、自动启动或 Codex 配置修改。插件安装、创建快捷方式和首次实际联调是彼此独立的授权步骤。
+
+## 换电脑继续开发
+
+在新的 Windows 电脑上安装 Git 和 Python 3.13，然后在自己控制的普通权限 PowerShell 中执行：
+
+```powershell
+git clone https://github.com/LeoSasion/golden-finger-for-codex.git
+cd golden-finger-for-codex
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\.venv\Scripts\python.exe -X utf8 scripts\static_validate.py
+.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v
+```
+
+后续构建也使用同一个虚拟环境解释器，避免依赖安装到另一套 Python：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_windows_release.py
+.\.venv\Scripts\python.exe scripts\verify_windows_release.py dist\golden-finger-0.2.0
+```
+
+Git 保存源码、测试、Skill、构建脚本和开发文档；`build/`、`dist/`、虚拟环境、UI 偏好和本机诊断截图不入库，发行包可在新电脑重新生成。不要迁移旧电脑的端点密钥、请求令牌或正在等待的请求。
+
+Codex 插件安装/启用及桌面快捷方式需要在新电脑单独配置，不会随克隆自动执行。窗口与 MCP 连接器必须使用同一完整发行包、相同 build ID；不要只复制 EXE，也不要混用旧缓存的连接器。
 
 ## 自包含 Windows 发行包
 

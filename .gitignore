@@ -9,6 +9,7 @@ venv/
 htmlcov/
 build/
 dist/
+.impeccable/review/
 *.egg-info/
 
 .env
