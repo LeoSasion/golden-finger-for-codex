@@ -1,7 +1,9 @@
 """Independent approval window for Codex金手指 (Golden Finger for Codex).
 
 This process is intentionally launched by the user, not by Codex or the MCP
-connector. Approval transitions are reachable only from GUI callbacks.
+connector. Approval transitions are reachable only from GUI callbacks, including
+the window-configured automatic-approval timer. Automatic receipts are not
+evidence of a human click.
 """
 
 from __future__ import annotations
@@ -98,6 +100,8 @@ THEME_REFRESH_SECONDS = 2.0
 DECISION_LAYOUT_DEBOUNCE_MS = 80
 RESPONSIVE_LAYOUT_DEBOUNCE_MS = 80
 UI_SETTINGS_FILENAME = "ui-settings.json"
+DEFAULT_AUTO_APPROVE_WAIT_SECONDS = 5
+MAX_AUTO_APPROVE_WAIT_SECONDS = 3_600
 ACTIVE_STATES = {"pending", "running"}
 TERMINAL_STATES = {
     "approved",
@@ -608,6 +612,7 @@ def default_ui_settings() -> dict[str, Any]:
     )
     return {
         "sound_enabled": True,
+        "auto_approve_wait_seconds": DEFAULT_AUTO_APPROVE_WAIT_SECONDS,
         "poll_wait_seconds": DEFAULT_POLL_WAIT_SECONDS,
         "max_pending_polls": DEFAULT_PENDING_POLL_CYCLES,
         "command_timeout_seconds": pending_wait_budget_seconds,
@@ -631,16 +636,40 @@ def normalize_poll_policy(_settings: dict[str, Any] | None = None) -> dict[str, 
     return policy
 
 
+def parse_auto_approve_wait_seconds(value: Any) -> int:
+    """Accept only bounded whole seconds; zero disables automatic approval."""
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.isascii() or not text.isdecimal() or len(text) > 4:
+            raise ValueError("自动审批等待必须是 0–3600 之间的整数秒；0 表示关闭。")
+        value = int(text)
+    if type(value) is not int or not 0 <= value <= MAX_AUTO_APPROVE_WAIT_SECONDS:
+        raise ValueError("自动审批等待必须是 0–3600 之间的整数秒；0 表示关闭。")
+    return value
+
+
 def load_ui_settings(path: Path | None = None) -> dict[str, Any]:
     settings = default_ui_settings()
     try:
         value = json.loads((path or ui_settings_path()).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return settings
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        settings["auto_approve_wait_seconds"] = 0
         return settings
     if not isinstance(value, dict):
+        settings["auto_approve_wait_seconds"] = 0
         return settings
     if isinstance(value.get("sound_enabled"), bool):
         settings["sound_enabled"] = value["sound_enabled"]
+    if "auto_approve_wait_seconds" in value:
+        try:
+            settings["auto_approve_wait_seconds"] = parse_auto_approve_wait_seconds(
+                value["auto_approve_wait_seconds"]
+            )
+        except ValueError:
+            settings["auto_approve_wait_seconds"] = 0
     return settings
 
 
@@ -658,6 +687,9 @@ def save_ui_settings(settings: dict[str, Any], path: Path | None = None) -> None
             json.dump(
                 {
                     "sound_enabled": bool(settings.get("sound_enabled", True)),
+                    "auto_approve_wait_seconds": parse_auto_approve_wait_seconds(
+                        settings.get("auto_approve_wait_seconds", DEFAULT_AUTO_APPROVE_WAIT_SECONDS)
+                    ),
                 },
                 handle,
                 ensure_ascii=True,
@@ -906,6 +938,7 @@ class CircularButton(tk.Button):
         command: Callable[[], None],
         variant: str,
         diameter: int,
+        on_interaction: Callable[[], None] | None = None,
     ) -> None:
         placeholder = tk.PhotoImage(master=parent, width=diameter, height=diameter)
         super().__init__(
@@ -928,6 +961,7 @@ class CircularButton(tk.Button):
         )
         self.button_text = text
         self.command = command
+        self._on_interaction = on_interaction
         self.variant = variant
         self._diameter = diameter
         self._enabled = True
@@ -945,6 +979,7 @@ class CircularButton(tk.Button):
         self._native_invoke_pending = False
         self._native_drain_owner: tk.Misc | None = None
         self._destroyed = False
+        self.configure(command=self._invoke_command)
         self.bind("<Enter>", self._on_enter)
         self.bind("<Motion>", self._on_motion)
         self.bind("<Leave>", self._on_leave)
@@ -980,7 +1015,7 @@ class CircularButton(tk.Button):
         self._enabled = enabled
         if not enabled:
             self._hovered = False
-            self._pressed = False
+            self._set_pressed(False)
         self.configure(
             takefocus=1 if enabled else 0,
             cursor="hand2" if enabled else "",
@@ -998,6 +1033,11 @@ class CircularButton(tk.Button):
         self._image_cache.clear()
         self.configure(width=bounded, height=bounded)
         self._redraw()
+
+    def set_text(self, text: str) -> None:
+        if text != self.button_text:
+            self.button_text = text
+            self._redraw()
 
     def _inside_circle(self, x: float, y: float) -> bool:
         center = self._diameter / 2
@@ -1313,10 +1353,13 @@ class CircularButton(tk.Button):
             ) -> int:
                 # Never call Tk from this native callback. Tk's main loop releases
                 # the GIL while waiting in user32, so re-entering Tk here can crash
-                # CPython. Only publish a flag for the scheduled Tk-thread drain.
+                # CPython. Publish a flag and reset Python-only timer state;
+                # the command still runs solely in the scheduled Tk-thread drain.
                 try:
                     if message == BUTTON_MESSAGE_CLICK and self._enabled:
                         self._native_invoke_pending = True
+                        if self._on_interaction is not None:
+                            self._on_interaction()
                     elif message == BUTTON_MESSAGE_NCDESTROY:
                         self._native_subclass_installed = False
                 except (AttributeError, RuntimeError):
@@ -1490,6 +1533,23 @@ class CircularButton(tk.Button):
             return ""
         return tk.Button.invoke(self)
 
+    def _invoke_command(self) -> Any:
+        if not self._enabled:
+            return None
+        if self._on_interaction is not None:
+            self._on_interaction()
+        try:
+            return self.command()
+        finally:
+            if self._on_interaction is not None:
+                self._on_interaction()
+
+    def _set_pressed(self, pressed: bool) -> None:
+        if pressed != self._pressed:
+            self._pressed = pressed
+            if self._on_interaction is not None:
+                self._on_interaction()
+
     def _on_enter(self, event: tk.Event[Any]) -> None:
         if self._enabled and self._inside_circle(event.x, event.y):
             self._hovered = True
@@ -1504,13 +1564,13 @@ class CircularButton(tk.Button):
             return
         self._hovered = hovered
         if not hovered:
-            self._pressed = False
+            self._set_pressed(False)
         self.configure(cursor="hand2" if hovered else "")
         self._redraw()
 
     def _on_leave(self, _event: tk.Event[Any]) -> None:
         self._hovered = False
-        self._pressed = False
+        self._set_pressed(False)
         self.configure(cursor="")
         self._redraw()
 
@@ -1518,7 +1578,7 @@ class CircularButton(tk.Button):
         if not self._enabled or not self._inside_circle(event.x, event.y):
             return "break"
         self.focus_set()
-        self._pressed = True
+        self._set_pressed(True)
         self._redraw()
         return None
 
@@ -1527,7 +1587,7 @@ class CircularButton(tk.Button):
             return "break"
         inside = self._inside_circle(event.x, event.y)
         was_pressed = self._pressed and inside
-        self._pressed = False
+        self._set_pressed(False)
         self._hovered = inside
         self.configure(cursor="hand2" if inside else "")
         self._redraw()
@@ -1539,19 +1599,19 @@ class CircularButton(tk.Button):
 
     def _on_focus_out(self, _event: tk.Event[Any]) -> None:
         self._focused = False
-        self._pressed = False
+        self._set_pressed(False)
         self._redraw()
 
     def _on_space_press(self, _event: tk.Event[Any]) -> str | None:
         if self._enabled:
-            self._pressed = True
+            self._set_pressed(True)
             self._redraw()
             return None
         return "break"
 
     def _on_space_release(self, _event: tk.Event[Any]) -> str | None:
         if self._enabled and self._pressed:
-            self._pressed = False
+            self._set_pressed(False)
             self._redraw()
             return None
         return "break"
@@ -2233,10 +2293,24 @@ class RequestStore:
             self._mark_gui_changed_locked()
             return record.public_snapshot()
 
-    def approve_from_gui(self, request_id: str) -> dict[str, Any]:
-        """The sole approval transition. Call only from a GUI event handler."""
+    def approve_from_gui(
+        self,
+        request_id: str,
+        *,
+        automatic_wait_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """Approve from a GUI click or the window's automatic-approval timer."""
 
+        if automatic_wait_seconds is not None and (
+            type(automatic_wait_seconds) is not int
+            or not 1 <= automatic_wait_seconds <= MAX_AUTO_APPROVE_WAIT_SECONDS
+        ):
+            raise RelayError(
+                "invalid_auto_approval_wait", "Automatic approval requires 1–3600 whole seconds."
+            )
         with self._condition:
+            if self._shutting_down:
+                raise RelayError("broker_stopping", "The relay window is stopping.")
             record = self._get_locked(request_id)
             if record.state != "pending":
                 raise RelayError(
@@ -2245,10 +2319,15 @@ class RequestStore:
                 )
             now = iso_timestamp()
             record.receipt = {
-                "human_action": "approved_once",
                 "decided_at": now,
                 "request_hash": record.request_hash,
             }
+            if automatic_wait_seconds is None:
+                record.receipt["human_action"] = "approved_once"
+                record.receipt["approval_mode"] = "manual"
+            else:
+                record.receipt["approval_mode"] = "automatic"
+                record.receipt["auto_approve_wait_seconds"] = automatic_wait_seconds
             record.updated_at = now
             if record.kind == "consent":
                 record.state = "approved"
@@ -3110,6 +3189,15 @@ class RelayWindow:
         self.server = server
         self.token = token
         self.closing = False
+        try:
+            self._auto_approve_wait_seconds = parse_auto_approve_wait_seconds(
+                settings.get("auto_approve_wait_seconds", DEFAULT_AUTO_APPROVE_WAIT_SECONDS)
+            )
+        except ValueError:
+            self._auto_approve_wait_seconds = 0
+        self._auto_approve_started_at: dict[str, float] = {}
+        self._auto_approval_editing = False
+        self._auto_approval_modal_depth = 0
         self.current_request_id: str | None = None
         self.current_item_id: str | None = None
         self._detail_request_id: str | None = None
@@ -3153,6 +3241,10 @@ class RelayWindow:
         except tk.TclError:
             pass
         self._ui_settings = dict(settings)
+        self._ui_settings["auto_approve_wait_seconds"] = self._auto_approve_wait_seconds
+        self.auto_approve_wait_value = tk.StringVar(
+            master=root, value=str(self._auto_approve_wait_seconds)
+        )
         self.sound_enabled = tk.BooleanVar(
             master=root,
             value=self._ui_settings["sound_enabled"],
@@ -3173,6 +3265,7 @@ class RelayWindow:
             pass
 
         self._build_ui()
+        self.auto_approve_wait_value.trace_add("write", self._on_auto_approve_edited)
         root.bind("<Configure>", self._schedule_responsive_layout, add="+")
         root.bind("<Escape>", self._on_escape, add="+")
         self._create_hit_shield()
@@ -3356,6 +3449,39 @@ class RelayWindow:
             takefocus=True,
         )
         self.diagnostics_button.grid(row=0, column=4, sticky="e", padx=(8, 0))
+        auto_preferences = ttk.Frame(header, style="HAR.TFrame")
+        auto_preferences.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(
+            auto_preferences, text="自动审批等待：", style="Meta.HAR.TLabel"
+        ).grid(row=0, column=0, sticky="w")
+        self.auto_approve_wait_input = ttk.Spinbox(
+            auto_preferences,
+            from_=0,
+            to=MAX_AUTO_APPROVE_WAIT_SECONDS,
+            increment=1,
+            width=5,
+            textvariable=self.auto_approve_wait_value,
+            style="HAR.TSpinbox",
+            takefocus=True,
+        )
+        self.auto_approve_wait_input.grid(row=0, column=1, sticky="w", padx=(4, 8))
+        self.auto_approve_wait_input.bind("<Return>", self._apply_auto_approve_wait)
+        ttk.Label(
+            auto_preferences, text="秒（0 = 关闭）", style="Meta.HAR.TLabel"
+        ).grid(row=0, column=2, sticky="w")
+        self.auto_approve_apply_button = ttk.Button(
+            auto_preferences,
+            text="应用",
+            command=self._apply_auto_approve_wait,
+            style="Diag.HAR.TButton",
+            width=0,
+            takefocus=True,
+        )
+        self.auto_approve_apply_button.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self.auto_approve_status = ttk.Label(
+            auto_preferences, text="", style="Meta.HAR.TLabel", justify=tk.LEFT
+        )
+        self.auto_approve_status.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
         main = ttk.Frame(
             self.root,
             padding=(16, 0, 16, 16),
@@ -3552,6 +3678,7 @@ class RelayWindow:
             self.decision_stage,
             text="停止",
             command=self.stop_selected,
+            on_interaction=self._reset_auto_approve_timers,
             variant="neutral",
             diameter=52,
         )
@@ -3560,6 +3687,7 @@ class RelayWindow:
             self.decision_stage,
             text="同意\n本次",
             command=self.approve_selected,
+            on_interaction=self._reset_auto_approve_timers,
             variant="primary",
             diameter=170,
         )
@@ -3568,6 +3696,7 @@ class RelayWindow:
             self.decision_stage,
             text="拒绝",
             command=self.reject_selected,
+            on_interaction=self._reset_auto_approve_timers,
             variant="danger",
             diameter=52,
         )
@@ -3682,6 +3811,7 @@ class RelayWindow:
 
     def _apply_responsive_layout(self, *, force: bool = False) -> None:
         width = max(WINDOW_SNAP_MIN_WIDTH, self.root.winfo_width())
+        self.auto_approve_status.configure(wraplength=max(200, width - 32))
         layout = responsive_window_layout(width)
         signature = (width, *layout.values())
         if not force and signature == self._responsive_layout_signature:
@@ -3865,6 +3995,7 @@ class RelayWindow:
     ) -> None:
         if expanded == self._detail_expanded:
             return
+        self._auto_approve_started_at.clear()
         self._detail_expanded = expanded
         layout = responsive_window_layout(self.root.winfo_width())
         if expanded:
@@ -4398,12 +4529,59 @@ class RelayWindow:
             self.palette = THEME_PALETTES[effective]
             self._apply_theme()
 
+    def _reset_auto_approve_timers(self) -> None:
+        # Python-only: safe even in the native button callback, never call Tk here.
+        self._auto_approve_started_at.clear()
+
+    def _show_modal_message(
+        self, show: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Native dialogs pump Tk without a grab; pause through all nesting."""
+
+        self._auto_approve_started_at.clear()
+        self._auto_approval_modal_depth += 1
+        try:
+            return show(*args, **kwargs)
+        finally:
+            self._auto_approval_modal_depth -= 1
+            if self._auto_approval_modal_depth == 0:
+                self._auto_approve_started_at.clear()
+
+    def _on_auto_approve_edited(self, *_args: str) -> None:
+        self._auto_approval_editing = True
+        self._auto_approve_started_at.clear()
+        self.auto_approve_status.configure(text="参数未应用，自动审批已暂停；点击“应用”重新计时。")
+
+    def _apply_auto_approve_wait(self, _event: tk.Event[Any] | None = None) -> str:
+        try:
+            wait_seconds = parse_auto_approve_wait_seconds(self.auto_approve_wait_value.get())
+        except ValueError as exc:
+            self.auto_approve_status.configure(text=str(exc))
+            return "break"
+        self._auto_approve_wait_seconds = wait_seconds
+        self._auto_approve_started_at.clear()
+        self._auto_approval_editing = False
+        self._ui_settings["auto_approve_wait_seconds"] = wait_seconds
+        self.auto_approve_status.configure(text=(
+            f"自动审批已开启：等待 {wait_seconds} 秒 · 命令到时直接执行"
+            if wait_seconds else "自动审批已关闭；每个请求都需要手动选择。"
+        ))
+        try:
+            save_ui_settings(self._ui_settings)
+        except OSError as exc:
+            self._show_modal_message(
+                messagebox.showwarning,
+                "无法保存自动审批设置",
+                f"本窗口已应用，但无法保存到下次启动：{exc}", parent=self.root,
+            )
+        return "break"
+
     def _on_sound_toggle(self) -> None:
         self._ui_settings["sound_enabled"] = bool(self.sound_enabled.get())
         try:
             save_ui_settings(self._ui_settings)
         except OSError as exc:
-            messagebox.showwarning(
+            self._show_modal_message(messagebox.showwarning,
                 "无法保存提示音设置",
                 f"本窗口已应用该选择，但无法保存到下次启动：{exc}",
                 parent=self.root,
@@ -4656,6 +4834,7 @@ class RelayWindow:
         self.guard_label.configure(text="仅授权当前冻结请求")
 
     def _render_empty_state(self) -> None:
+        self.approve_button.set_text("同意\n本次")
         has_hidden_items = bool(self._request_rows or self._codex_tasks)
         render_signature = (
             "empty",
@@ -4685,6 +4864,7 @@ class RelayWindow:
         self._content_render_signature = render_signature
 
     def _render_codex_task(self, task_id: str) -> None:
+        self.approve_button.set_text("同意\n本次")
         task = self._codex_tasks.get(task_id)
         if task is None:
             self._render_empty_state()
@@ -4810,6 +4990,76 @@ class RelayWindow:
         self.restart_button.configure(state=tk.NORMAL if enabled else tk.DISABLED)
         self._inventory_render_signature = render_signature
 
+    def _process_auto_approval(self, rows: list[dict[str, Any]]) -> bool:
+        """Give each pending card a full monotonic wait, independent of selection."""
+
+        if self.closing:
+            self._auto_approve_started_at.clear()
+            return False
+        if self._auto_approval_editing or self._auto_approve_wait_seconds == 0:
+            self._auto_approve_started_at.clear()
+            if not self._auto_approval_editing:
+                self.auto_approve_status.configure(text="自动审批已关闭；每个请求都需要手动选择。")
+            return False
+        if (
+            self._auto_approval_modal_depth > 0
+            or self.root.grab_current() is not None
+            or any(button._pressed or button._native_invoke_pending
+                   for button in (self.approve_button, self.reject_button, self.stop_button))
+        ):
+            self._auto_approve_started_at.clear()
+            self.auto_approve_status.configure(text="正在查看详情或操作窗口，自动审批暂停；结束后重新计时。")
+            return False
+        now = time.monotonic()
+        pending_ids = {str(row["request_id"]) for row in rows if row["state"] == "pending"}
+        self._auto_approve_started_at = {
+            request_id: started
+            for request_id, started in self._auto_approve_started_at.items()
+            if request_id in pending_ids
+        }
+        changed = False
+        for row in rows:
+            request_id = str(row["request_id"])
+            if request_id not in pending_ids:
+                continue
+            started = self._auto_approve_started_at.setdefault(request_id, now)
+            if now - started < self._auto_approve_wait_seconds:
+                continue
+            try:
+                self.store.approve_from_gui(
+                    request_id, automatic_wait_seconds=self._auto_approve_wait_seconds
+                )
+            except RelayError:
+                # The authoritative store rechecks expiry and concurrent cancellation.
+                pass
+            self._auto_approve_started_at.pop(request_id, None)
+            changed = True
+        if self._auto_approve_started_at:
+            remaining = max(0, math.ceil(
+                min(self._auto_approve_started_at.values()) + self._auto_approve_wait_seconds - now
+            ))
+            self.auto_approve_status.configure(text=(
+                f"自动审批：{len(self._auto_approve_started_at)} 项待处理，最近 {remaining} 秒后同意"
+                " · 命令到时执行"
+            ))
+        else:
+            self.auto_approve_status.configure(text=(
+                f"自动审批已开启：等待 {self._auto_approve_wait_seconds} 秒 · 命令到时直接执行"
+            ))
+        return changed
+
+    def _update_approval_button_text(self, request_id: str, *, pending: bool) -> None:
+        """Show only this card's remaining wait, independently of detail caching."""
+        started = self._auto_approve_started_at.get(request_id)
+        if pending and started is not None and self._auto_approve_wait_seconds > 0:
+            remaining = max(1, math.ceil(
+                started + self._auto_approve_wait_seconds - time.monotonic()
+            ))
+            text = f"同意\n{remaining} 秒"
+        else:
+            text = "同意\n本次"
+        self.approve_button.set_text(text)
+
     def refresh(self) -> None:
         if self.closing:
             return
@@ -4835,6 +5085,10 @@ class RelayWindow:
         else:
             rows = list(self._request_rows.values())
             new_request_ids = set()
+        if self._process_auto_approval(rows):
+            store_revision, rows, pending_count, running_count = self.store.gui_snapshot()
+            self._store_gui_revision = store_revision
+            self._request_rows = {str(row["request_id"]): row for row in rows}
         self._codex_tasks = {task.task_id: task for task in inventory.tasks}
         self._refresh_task_tree()
 
@@ -4921,6 +5175,7 @@ class RelayWindow:
         except RelayError:
             return
         frozen = detail["frozen"]
+        self._update_approval_button_text(request_id, pending=detail["state"] == "pending")
         poll_policy = detail["poll_policy"]
         remaining_seconds: int | None = None
         if detail["state"] == "pending":
@@ -5100,7 +5355,7 @@ class RelayWindow:
         try:
             self.store.approve_from_gui(request_id)
         except RelayError as exc:
-            messagebox.showerror("无法批准", exc.message, parent=self.root)
+            self._show_modal_message(messagebox.showerror, "无法批准", exc.message, parent=self.root)
         self._render_detail(request_id)
         self.tree.focus_set()
 
@@ -5111,7 +5366,7 @@ class RelayWindow:
         try:
             self.store.reject_from_gui(request_id)
         except RelayError as exc:
-            messagebox.showerror("无法拒绝", exc.message, parent=self.root)
+            self._show_modal_message(messagebox.showerror, "无法拒绝", exc.message, parent=self.root)
         self._render_detail(request_id)
         self.tree.focus_set()
 
@@ -5122,7 +5377,7 @@ class RelayWindow:
         try:
             self.store.cancel_from_gui(request_id)
         except RelayError as exc:
-            messagebox.showerror("无法停止", exc.message, parent=self.root)
+            self._show_modal_message(messagebox.showerror, "无法停止", exc.message, parent=self.root)
         self._render_detail(request_id)
         self.tree.focus_set()
 
@@ -5131,7 +5386,7 @@ class RelayWindow:
             return
         acquired, reason = self.store.try_begin_codex_restart()
         if not acquired:
-            messagebox.showwarning(
+            self._show_modal_message(messagebox.showwarning,
                 "暂不能重启 Codex",
                 {
                     "relay_requests_active": "仍有授权请求未结束。",
@@ -5209,22 +5464,22 @@ class RelayWindow:
             return
         if result.ok:
             self.restart_status_label.configure(text="Codex 已重新打开")
-            messagebox.showinfo("安全重启完成", result.message, parent=self.root)
+            self._show_modal_message(messagebox.showinfo, "安全重启完成", result.message, parent=self.root)
         else:
             self.restart_status_label.configure(text=result.message)
-            messagebox.showwarning("未执行重启", result.message, parent=self.root)
+            self._show_modal_message(messagebox.showwarning, "未执行重启", result.message, parent=self.root)
 
     def open_computer_use_guidance(self) -> None:
         try:
             guidance = resolve_computer_use_guidance()
         except OSError as exc:
-            messagebox.showerror("无法找到 Computer Use 指南", str(exc), parent=self.root)
+            self._show_modal_message(messagebox.showerror, "无法找到 Computer Use 指南", str(exc), parent=self.root)
             return
         try:
             # Default ShellExecute verb honors the user's .md file association.
             os.startfile(str(guidance))
         except OSError as exc:
-            messagebox.showerror(
+            self._show_modal_message(messagebox.showerror,
                 "无法打开 Computer Use 指南",
                 f"文件：{guidance}\n\n"
                 "请检查文件权限，并为 .md 文件设置默认打开软件后重试。\n\n"
@@ -5339,7 +5594,8 @@ class RelayWindow:
 
     def on_close(self) -> None:
         pending, running = self.store.active_counts()
-        if (pending or running) and not messagebox.askyesno(
+        if (pending or running) and not self._show_modal_message(
+            messagebox.askyesno,
             "关闭 Codex金手指",
             f"仍有 {pending} 个待确认、{running} 个执行中请求。\n"
             "关闭后，待确认请求会取消；执行中请求的 Windows Job Object 进程树会被终止。\n"

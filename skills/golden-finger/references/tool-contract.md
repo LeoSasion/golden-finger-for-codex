@@ -28,7 +28,7 @@ Health is pull-only and has no background subscription. A successful result does
 
 ## request_consent
 
-Creates one natural-language authorization card. A click returns the exact configured \`approved_reply\`; it executes no program.
+Creates one natural-language authorization card. A manual click or the window's configured automatic timer returns the exact configured \`approved_reply\`; it executes no program. Automatic approval defaults to five seconds; the user can change the window's wait or set it to zero to disable it. The timer is not the 900-second MCP polling wait.
 
 Required fields: \`exact_action\`, \`target\`, \`risk\`, \`recovery\`, \`idempotency_key\`, `source_label`, `source_project`, and `source_task`.
 
@@ -57,11 +57,11 @@ Required fields: `request_id` and the matching `claim_token`. Active responses r
 
 Zero performs an immediate read without consuming the count. Any positive wait uses the request's exact frozen `poll_policy.wait_seconds`, fixed at 900 seconds. A \`pending\` or \`running\` result includes a structured polling directive with the exact next tool and arguments. Codex must follow that directive rather than keep a separate polling configuration. The broker does not proactively wake a completed Codex turn.
 
-Positive waits consume the frozen pending-poll budget only while the request remains \`pending\`; zero-wait reads do not. When the pending count or elapsed validity is exhausted before a click, the request becomes \`expired\`. Once a command is \`running\`, its separate frozen execution timeout remains authoritative so a monitoring counter never silently abandons or kills an approved process.
+Positive waits consume the frozen pending-poll budget only while the request remains \`pending\`; zero-wait reads do not. When the pending count or elapsed validity is exhausted before approval, the request becomes \`expired\`. Once a command is \`running\`, its separate frozen execution timeout remains authoritative so a monitoring counter never silently abandons or kills an approved process.
 
 ## cancel_authorization
 
-Cancels a pending request. It requires the matching `request_id` and `claim_token`. It does not revoke an already clicked approval and cannot reliably undo a process that has started.
+Cancels a pending request. It requires the matching `request_id` and `claim_token`. It does not revoke an existing manual or automatic approval and cannot reliably undo a process that has started.
 
 If Codex sends MCP `notifications/cancelled` for an active tool call, the synchronous connector can process it only after the current 900-second broker wait returns. It then makes a best-effort cancellation of a still-pending card with the recorded claim. It never terminates an already approved command.
 
@@ -75,7 +75,7 @@ For command requests:
 
 \`pending -> running -> completed | failed | timed_out\`
 
-Terminal snapshots include the request ID, claim fingerprint, request hash, timestamps, and decision receipt. Command snapshots additionally include exit code, stdout, stderr, and truncation flags. Public snapshots never contain the claim token or connector instance ID.
+Terminal snapshots include the request ID, claim fingerprint, request hash, timestamps, and decision receipt. Approved snapshots distinguish `receipt.approval_mode=manual` (with `human_action=approved_once`) from `receipt.approval_mode=automatic` (with `auto_approve_wait_seconds` and no `human_action`). An automatic receipt is not proof of explicit human confirmation. Command snapshots additionally include exit code, stdout, stderr, and truncation flags. Public snapshots never contain the claim token or connector instance ID.
 
 When the user closes the window while a card is pending, a graceful shutdown marks it `cancelled` with `result.reason_code=relay_window_closed`. The MCP response then includes `scope_recovery`. Restarting the Broker cannot resume that old in-memory request. A running command's Job Object is terminated, but the external outcome may still be uncertain because completed side effects cannot be rolled back; it must never be replayed automatically.
 

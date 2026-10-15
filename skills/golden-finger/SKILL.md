@@ -26,6 +26,7 @@ For `project` or `global`, persist only the small marked block described in the 
 - For cross-project use, the plugin runtime must be installed and enabled in the user's personal/global Codex plugin environment. A checkout or project-local source copy is only a development artifact; project/global scope markers select an already available Skill and cannot load the plugin into other projects.
 - The user must launch the independent relay window themselves.
 - Treat the window click as authorization for exactly the frozen request shown there, never as standing consent.
+- The window now defaults to automatic approval after five seconds, configurable from 0 to 3600 seconds (0 disables). Check `receipt.approval_mode`: `automatic` is a timer result, not evidence of a human click. If applicable rules require explicit human confirmation, require manual approval; ask the user to disable automatic approval in the window and click the exact card instead of treating a timer reply as confirmation.
 - Preserve any stricter workspace, system, Codex, or native tool approval rule. This skill cannot satisfy or suppress a native approval prompt.
 - Never use `request_command_execution` or any authorization-transport side effect to launch or control Codex, Codex App Server, task routing, UI automation, local Codex databases, rollouts, or session files.
 - That execution ban does not exclude `request_consent` when the card only collects one exact human decision about a later Codex administrative action. The click returns `reply_text` to the current tool call; it does not perform the later action, bypass a native prompt, or make an otherwise forbidden action permissible.
@@ -65,7 +66,7 @@ Use \`request_consent\` when the only requested response is a natural-language a
 - \`target\`: exact process, file, task, or object.
 - \`risk\`: concrete impact and interruption risk.
 - \`recovery\`: practical rollback or recovery path.
-- \`approved_reply\`: the exact short reply to return after the click.
+- \`approved_reply\`: the exact short reply to return after manual or window-configured automatic approval.
 - \`idempotency_key\`: a fresh opaque key for this request and this task. Reuse it only for an identical retry in the same connector instance.
 - `source_label`, `source_project`, and `source_task`: concise, truthful human-readable origin evidence for the shared queue. They are not authenticated identity.
 

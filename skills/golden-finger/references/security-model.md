@@ -4,9 +4,9 @@ The relay separates three roles:
 
 1. Codex proposes one bounded request through the plugin MCP server.
 2. The independently launched broker freezes and displays the request.
-3. A human either approves that exact request once or rejects it.
+3. The window decides the exact request through a human click or its configured automatic-approval timer.
 
-The MCP-facing process has no approve operation. Approval exists only as a GUI event in the broker process. The authorization channel never launches or controls Codex and never injects text into another task. A separate, GUI-only lifecycle coordinator may read the running Codex Desktop host's `list_threads` result and perform a fail-closed graceful restart after a direct user click; it is not callable through the relay protocol.
+The MCP-facing process has no approve operation. Approval exists only as a GUI event in the broker process, including its local automatic timer. The authorization channel never launches or controls Codex and never injects text into another task. A separate, GUI-only lifecycle coordinator may read the running Codex Desktop host's `list_threads` result and perform a fail-closed graceful restart after a direct user click; it is not callable through the relay protocol.
 
 ## Guarantees
 
@@ -24,7 +24,8 @@ The MCP-facing process has no approve operation. Approval exists only as a GUI e
 - One decision per request and a frozen, hashed polling policy with an expiry time.
 - Program plus argument-array execution with \`shell=False\`.
 - Bounded runtime and bounded stdout/stderr retention.
-- No “always allow” control.
+- Automatic approval defaults to a five-second per-card wait, configurable in the window from 0 to 3600 whole seconds; zero disables it. It covers every pending card, including commands. It does not add an MCP approval operation or permit native Codex approval bypasses.
+- Automatic receipts have `approval_mode=automatic` and `auto_approve_wait_seconds`, without `human_action`. Manual approval has `approval_mode=manual` and `human_action=approved_once`. A timer receipt must never be presented as proof of a human click or used where applicable rules require explicit human confirmation.
 - Routing scope is kept in the Codex instruction layer, never in Broker request state; it grants no approval and is not included in request hashes, claim capabilities, or decision receipts.
 - Within one connector-instance namespace, a reused idempotency key must carry the identical Codex proposal. A settings change between retries returns the already-frozen request and the same claim capability rather than applying the new policy or creating a conflict. The same key in another connector namespace creates an independent request.
 - Codex task inventory is read only from the already-running desktop app-tools bridge. The connector forwards a host-provided task ID as a weak lookup hint; the Broker dynamically discovers the exact `list_threads` tool, requires the reviewed schema version, includes pinned tasks, rejects partial/truncated/unknown-status responses, and verifies that the named-pipe server process is an allowed Codex Desktop executable.

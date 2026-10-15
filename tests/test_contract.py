@@ -963,6 +963,8 @@ class ComputerUseGuidanceTests(unittest.TestCase):
 
     def test_button_reresolves_and_uses_the_system_default_open_verb(self) -> None:
         window = RelayWindow.__new__(RelayWindow)
+        window._auto_approval_modal_depth = 0
+        window._auto_approve_started_at = {}
         window.root = object()
         paths = [Path("C:/user-one/guide.md"), Path("D:/codex-home/guide.md")]
         with patch("relay_broker.resolve_computer_use_guidance", side_effect=paths) as resolve, patch(
@@ -977,6 +979,8 @@ class ComputerUseGuidanceTests(unittest.TestCase):
 
     def test_button_reports_missing_files_without_launching_an_app(self) -> None:
         window = RelayWindow.__new__(RelayWindow)
+        window._auto_approval_modal_depth = 0
+        window._auto_approve_started_at = {}
         window.root = object()
         with patch(
             "relay_broker.resolve_computer_use_guidance",
@@ -991,6 +995,8 @@ class ComputerUseGuidanceTests(unittest.TestCase):
 
     def test_button_reports_default_app_failures_with_recovery_advice(self) -> None:
         window = RelayWindow.__new__(RelayWindow)
+        window._auto_approval_modal_depth = 0
+        window._auto_approve_started_at = {}
         window.root = object()
         guidance = Path("C:/some-user/guidance.md")
         with patch(
@@ -1016,7 +1022,9 @@ class AppearanceTests(unittest.TestCase):
         )
         with patch("relay_broker.CodexTaskMonitor.start"), patch(
             "relay_broker.apply_native_window_appearance", return_value=False
-        ), patch("relay_broker.read_codex_theme_preference", return_value="light"):
+        ), patch("relay_broker.read_codex_theme_preference", return_value="light"), patch.object(
+            RelayWindow, "_notify_new_request"
+        ), patch.object(RelayWindow, "_activate_new_request_window"):
             try:
                 window = RelayWindow(
                     root, store=store, server=server, token="layout-test",
@@ -1436,7 +1444,7 @@ class AppearanceTests(unittest.TestCase):
             )
         )
 
-    def test_ui_preferences_persist_only_sound_and_ignore_legacy_policy(self) -> None:
+    def test_ui_preferences_persist_sound_and_auto_approval_but_ignore_legacy_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             settings_path = Path(temporary_directory) / "ui-settings.json"
             save_ui_settings(
@@ -1453,13 +1461,14 @@ class AppearanceTests(unittest.TestCase):
                 {
                     "sound_enabled": False,
                     "poll_wait_seconds": 900,
+                    "auto_approve_wait_seconds": 5,
                     "max_pending_polls": 10,
                     "command_timeout_seconds": 9_000,
                 },
             )
             self.assertEqual(
                 json.loads(settings_path.read_text(encoding="utf-8")),
-                {"sound_enabled": False},
+                {"sound_enabled": False, "auto_approve_wait_seconds": 5},
             )
 
     def test_install_diagnostics_are_sanitized_and_detect_exact_cache(self) -> None:

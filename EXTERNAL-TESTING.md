@@ -27,6 +27,8 @@ Expected result: the same ordinary-privilege window appears without a terminal. 
 
 ## 3. Natural-language callback smoke test
 
+For the existing manual-click, rejection, expiry, scope, and lifecycle checks below, first set “自动审批等待” to `0` and click “应用”. The default is now five seconds, so leaving it enabled would approve pending cards before these manual checks finish. Section 13 separately exercises the automatic path.
+
 In a second terminal:
 
     python scripts\manual_smoke_client.py consent
@@ -94,7 +96,7 @@ The unit suite additionally creates a temporary direct `.py` argument, verifies 
 ## 10. Scope and window-lifecycle recovery
 
 - Install and enable the plugin in the user's personal/global Codex plugin environment, then open a fresh task in an unrelated project that contains no Golden Finger source files. Verify the Skill and MCP are discoverable there. A project-local checkout or an `AGENTS.md` scope marker alone must not be treated as installing the plugin. Submit one card and verify the unrelated project's normalized root and task title appear in the window.
-- In a fresh Codex task with no persisted scope marker, trigger the Skill four times independently and choose `once`, `task`, `project`, and `global`. The first question must state that scope is routing only and every action still needs its own click. `project` must display the normalized absolute project root; it must not be offered when no root is known.
+- In a fresh Codex task with no persisted scope marker, trigger the Skill four times independently and choose `once`, `task`, `project`, and `global`. The first question must state that scope is routing only and every action still needs its own frozen card; automatic receipts are not proof of a human click. `project` must display the normalized absolute project root; it must not be offered when no root is known.
 - For `project` and `global`, verify that only the marked Golden Finger block is added to the disclosed active instruction file. With no override, this is `AGENTS.md`; repeat with an existing `AGENTS.override.md` and verify the block is written there instead of an inactive sibling. Unrelated instructions remain byte-for-byte intact. A new task should inherit that scope, while `task` must not. Cancel the persistent scope and verify that only the marked block is removed from the same file.
 - With no window running, call `relay_health`. It must return `reachable=false`, `window_state=not_running_or_unreachable`, and two choices: start the window while keeping scope, or cancel scope. It must submit no card and must not start a process.
 - Pause shutdown after the Broker sets its stopping flag but before its TCP endpoint disappears. `relay_health` must return `reachable=false`, `window_state=closing`, and the same two recovery choices; a new request returning `broker_stopping` must also carry them.
@@ -124,3 +126,12 @@ The verifier must recalculate every manifest hash, require the shared PyInstalle
 Copy the complete built package, including `bin\golden-finger.runtime`, to a clean Windows user account with no Python on PATH; copying either EXE by itself is unsupported. Launch `bin\GoldenFinger.exe` manually and verify the window appears. Point the package's `.mcp.json` at `bin\golden-finger-mcp.exe` through the separately authorized installation flow, restart/open a new Codex task as required, then repeat health and consent smoke checks. Confirm no build directory, source interpreter, developer checkout, or user-level Python dependency is required at runtime.
 
 The GitHub Actions `Windows release verification` workflow must pass from a clean checkout and upload only `golden-finger-0.2.0-windows-x64.zip`. Publishing that artifact, installing it, changing shortcuts, or replacing a running window remains a separate explicit action.
+
+## 13. Automatic approval wait
+
+- Set “自动审批等待” to `5` and apply. Submit the fixed consent smoke scenario without clicking. It must remain pending for the full five seconds from first GUI observation, then become approved at a subsequent 250 ms refresh; the reply is “同意”. Its receipt must say `approval_mode=automatic`, contain the applied wait, and contain no `human_action`.
+- Under a separately reviewed command smoke run, leave the fixed print card untouched. After the wait it must enter running and complete using the same frozen-executable checks and Job Object as manual approval. An automatic receipt does not replace native Codex approval or any rule requiring explicit human confirmation.
+- Change the wait to a different whole second value and apply. Every pending card starts a fresh complete wait; restart the window and verify the chosen wait persists independently of the fixed 900 × 10 polling policy. Set it to `0`, apply, and verify no untouched card is approved.
+- Submit two consent cards a few seconds apart and switch selection. Each card retains its own wait; selection does not move or reset another card's deadline. Manually approve, reject, stop, or cancel one before its deadline; its terminal decision must never be overwritten. Expired cards must not be approved.
+- Begin editing the parameter without applying it, open the detail overlay, hold a decision button pressed, or open the window-close confirmation. Automatic approval must pause and discard old timers; when interaction ends, every still-pending card receives a new complete wait. Invalid, fractional, negative, empty, or out-of-range input must not enable approval. A corrupt saved settings file disables automatic approval.
+- Check the wait input, apply button, status warning, and countdown in both themes and at the Snap minimum width. Restore the desired wait after testing; do not silently change a real running broker's preferences from tests.

@@ -8,7 +8,7 @@ The plugin runtime and the routing scope are separate layers. Golden Finger must
 
 If the current Codex task has no explicit choice and no applicable marked block in the active Codex instruction file, ask in ordinary conversation before calling any relay tool:
 
-> 首次使用 Codex金手指。请选择引用范围：仅本次 / 当前任务（推荐） / 当前项目 `<absolute-root>` / 所有项目 / 暂不使用。这个选择只决定以后何时调用金手指，不代表同意任何操作；每笔动作仍需在窗口中单独点击。
+> 首次使用 Codex金手指。请选择引用范围：仅本次 / 当前任务（推荐） / 当前项目 `<absolute-root>` / 所有项目 / 暂不使用。这个选择只决定以后何时调用金手指，不代表同意任何操作；每笔动作仍需单独的冻结请求，由窗口按手动选择或自动审批等待设置决定；自动回执不代表亲自点击。
 
 Normalize the answer as:
 

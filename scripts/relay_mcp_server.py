@@ -248,8 +248,10 @@ TOOLS: list[dict[str, Any]] = [
         "title": "请求一次自然语言授权",
         "description": (
             "Display one exact natural-language consent request in the independent "
-            "window. Clicking approve executes no program and returns approved_reply "
-            "to this MCP tool call. This is not a native Codex approval. A pending "
+            "window. Approval by a GUI click or the window's configured automatic "
+            "timer executes no program and returns approved_reply to this MCP tool call. "
+            "Check receipt.approval_mode: automatic is not evidence of a human click. "
+            "This is not a native Codex approval. A pending "
             "result requires same-turn polling until terminal."
         ),
         "inputSchema": {
@@ -261,7 +263,7 @@ TOOLS: list[dict[str, Any]] = [
                     "minLength": 1,
                     "maxLength": 200,
                     "default": "同意",
-                    "description": "Exact text returned only after the one-time click.",
+                    "description": "Exact text returned after manual or window-configured automatic approval.",
                 },
             },
             "required": COMMON_REQUIRED,
@@ -278,10 +280,12 @@ TOOLS: list[dict[str, Any]] = [
         "name": "request_command_execution",
         "title": "请求执行一次精确命令",
         "description": (
-            "Display and, only after a one-time GUI click, execute an exact local "
+            "Display and, after a GUI click or the window's configured automatic timer, "
+            "execute an exact local "
             "executable plus argument array with shell=False. The broker rejects "
             "Codex/self-control targets and retains bounded output. A pending/running "
-            "result requires same-turn polling until terminal."
+            "result requires same-turn polling until terminal. "
+            "Check receipt.approval_mode: automatic is not evidence of a human click."
         ),
         "inputSchema": {
             "type": "object",
