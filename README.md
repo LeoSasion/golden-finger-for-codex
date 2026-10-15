@@ -1,3 +1,5 @@
+![Codex金手指：复古电脑与金色游戏卡带](assets/readme-hero.png)
+
 # Codex金手指
 
 英文名：Golden Finger for Codex。
