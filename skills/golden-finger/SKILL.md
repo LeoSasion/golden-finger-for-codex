@@ -86,7 +86,7 @@ Use \`request_command_execution\` only when the window should execute a local pr
 
 Never use `request_command_execution` with `codex.exe`, `codex app-server`, or another command that launches or controls Codex. Use `request_consent` only for the human-decision step when that step is otherwise permitted; perform any later authorized action through its proper execution surface.
 
-The relay uses one fixed policy: a 900-second positive wait, at most 10 pending polls, and their 9,000-second product as both pending validity and command-execution cap. The window has no mutable polling inputs and ignores legacy saved poll values. The broker freezes this policy into each request and caps any shorter caller-supplied approval expiry or command timeout; never treat one MCP poll as the request expiry or override the frozen policy with a second Codex-side configuration.
+The relay freezes a 9,000-second pending validity and command-execution cap. MCP waits default to 30 seconds and may be 0–900 seconds; zero reads immediately. Positive waits never consume an expiry count: only the monotonic pending deadline expires a card. Keep the original claim and follow polling.next_arguments after each active response.
 
 PowerShell is just one possible executable. Python does not bypass authorization: invoking \`python.exe\` still requires the same exact one-time approval.
 
@@ -98,10 +98,12 @@ The broker is pull-only and cannot wake a Codex turn after that turn ends. Every
 
 - \`approved\`: for consent, use only the returned \`reply_text\` and continue.
 - \`completed\`: for commands, inspect exit code, stdout, stderr, and truncation flags before continuing.
-- \`rejected\`, \`cancelled\`, \`expired\`, \`failed\`, or \`timed_out\`: stop the authorized action and report the terminal result.
-- \`pending\` or \`running\`: this is not a stopping point. Keep the current turn open and immediately call the exact `polling.next_tool` with the exact `polling.next_arguments`. Those arguments include `request_id`, `claim_token`, and `wait_seconds`; preserve all three byte-for-byte and re-read them after every response rather than reconstructing a token or reusing a hard-coded wait. Pending requests expire when their frozen time or poll-count budget is exhausted; running commands continue under their separately frozen execution timeout.
+- \`rejected\`, \`cancelled\`, \`expired\`, \`failed\`, \`timed_out\`, or \`terminated\`: stop the authorized action and report the terminal result.
+- \`pending\` or \`running\`: this is not a stopping point. Keep the current turn open and immediately call the exact `polling.next_tool` with the exact `polling.next_arguments`. Those arguments include `request_id`, `claim_token`, and `wait_seconds`; preserve all three byte-for-byte and re-read them after every response rather than reconstructing a token or reusing a hard-coded wait. Pending requests expire only when their frozen monotonic deadline is reached; running commands continue under their separately frozen execution timeout.
 
-The connector reads Desktop cancellation notifications synchronously, so Desktop **Stop** can remain delayed until the active 900-second broker wait returns. If the user wants to end that wait immediately, direct them to the relay window's small **停止** control. It transitions only a still-pending request to `cancelled`, wakes the active broker wait, and means neither approval nor rejection. It does not cancel an approved or running command.
+The connector continues reading Desktop cancellation notifications during active waits. It interrupts its wait and attempts to cancel the still-pending card using the recorded claim; the response reports the Broker's cancellation outcome. If the Broker cannot confirm cancellation, do not claim that the card was cancelled. A command that has already been approved is never terminated by MCP cancellation or `cancel_authorization`.
+
+The window's **停止** control cancels a still-pending card immediately without approval or rejection. For an approved command, the control becomes **终止** and asks for confirmation before ending that command's queue entry or process tree. When the user explicitly requests termination through Codex, call `terminate_command` with that command's original `request_id` and `claim_token`. Termination preserves captured output but does not undo completed side effects; never replay the action automatically.
 
 Never return a final answer or ask the user to send “已完成” while the state is \`pending\` or \`running\`. Do not ask for another confirmation merely because one bounded poll returned active. Do not submit a duplicate with a new key. Never omit, guess, log for convenience, or transfer the claim token; if it is unavailable, fail closed instead of trying another task's request ID. Do not edit or reinterpret `poll_policy`, `pending_polls_remaining`, or `policy_revision`; they are broker-owned synchronization data. Send concise progress commentary about once per minute while continuing the same request.
 
@@ -119,3 +121,11 @@ A button-generated “同意” is a structured callback result, not proof that 
 For an eligible Codex-related consent card, an `approved` result is authorization for the exact disclosed later action, not evidence that the action already ran. Continue in the same turn only if that action is still allowed by every applicable rule; otherwise report the remaining blocker.
 
 Read [security model](references/security-model.md) before proposing changes to the broker boundary. Read [tool contract](references/tool-contract.md) when debugging tool states or composing a request.
+
+## Preflight, recovery and output
+
+Use `preflight_command` to check an interpreter, argument vector, working directory, literal environment overrides and output encoding without executing or creating a card. `environment`, `output_encoding` and explicit `response_files` can accompany a command request. Direct response files must appear as exact @path arguments and are fingerprinted before approval. Templates in scripts/command_templates.py prepare Python, PowerShell, Node and npm invocation arrays.
+
+If submission has an unknown outcome, use its exact recovery_token and payload_hash with `recover_authorization`. Recovery queries an existing request and never resubmits it. Keep recovery capabilities private, like claims. A missing record after Broker restart does not prove the action never occurred; report uncertainty and do not replay automatically.
+
+Use `read_command_output` with the original request_id and claim_token for bounded byte-offset pages. Retained head/tail output can contain a gap; follow next_offset and do not treat omitted middle bytes as a complete log. Progress notifications are optional and stop with the active tool call; they cannot wake a finished Codex turn.

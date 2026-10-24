@@ -1,5 +1,19 @@
 # External testing
 
+## 0.3.0 execution, installation, and UI acceptance
+
+The non-automatic-approval regression suites are `test_mcp_runtime.py`, `test_execution_runtime.py`, `test_release_workflow.py`, `test_diagnostics_ui.py`, and `test_tray_runtime.py`. Existing automatic-approval tests remain unchanged. Additional acceptance:
+
+- Saturate ordinary MCP workers and Broker blocking waits; verify health, immediate read, cancellation and explicit termination still respond. Cancel during submission and after claim-cache eviction; report acknowledged, already-started, or unavailable outcomes without hanging or losing the claim.
+- Execute bounded fixture commands in two different projects and in two subdirectories of the same Git workspace. Verify global concurrency four, serialization within the same workspace, queued termination without startup, and starting/running termination with retained output.
+- Return large Chinese text, backslashes and quotes in both stdout and stderr with long RPC IDs. Check the final serialized frames stay within 1 MiB and preserve state/exit status and truncation flags.
+- Disable automatic selection while keeping notifications enabled; new cards must still notify once without replacing the selected card. Open details and verify later cards do not replace the selection.
+- Test tray creation failure, normal unexpected exit, explicit show, and exit with active requests. Never leave the window hidden after an unavailable tray. Restart Explorer and verify the icon or window remains recoverable.
+- Import a complete ZIP into an isolated installation root; check status, stable launchers, upgrade, rollback and export. Reject modified inventories, extra files, path traversal, links, running installations and unexpected ownership. Verify the original README hero survives all copies.
+- Check malformed cache markers and ambiguous plugin entries; the diagnostic must remain readable and provide qualified next steps. Export a summary and inspect it for absence of command text, output, raw source labels and tokens.
+
+Source unit checks are not a substitute for manual validation on clean Windows 10/11, multiple monitors, 100%/150%/200% DPI, Narrator and restricted organization policies. Record unavailable environments and failed screenshot tools explicitly.
+
 These checks are intentionally separated from Codex Desktop. Run them in a user-controlled terminal only after deciding to test this exact source tree.
 
 ## 1. Static and unit checks
@@ -9,7 +23,7 @@ From the plugin root:
     python scripts\static_validate.py
     python -m unittest discover -s tests -v
 
-The unit suite does not launch Codex or any user-visible GUI. On Windows it creates hidden Tk controls for layout and native-button checks, plus a Job Object and one bounded, harmless Python child solely to verify containment and termination; the tests own cleanup and have no persistent output.
+The unit suite does not launch Codex or any user-visible GUI. On Windows it creates hidden Tk controls for layout and native-button checks, plus bounded, harmless Python process trees and loopback servers to verify containment, cancellation, queueing, and termination. Tests own their temporary directories and process cleanup; they do not modify the user's Codex installation or plugin settings.
 
 ## 2. Start the independent window
 
@@ -17,7 +31,7 @@ In an ordinary, unelevated terminal:
 
     python scripts\relay_broker.py
 
-Expected result: a window titled “Codex金手指” appears without a redundant privilege banner. Starting a second copy must fail; each command request detail must still identify the effective execution privilege.
+Expected result: a window titled “Codex金手指” appears with the effective privilege level in the header. Starting a second copy must fail; each command request detail must also identify the effective execution privilege.
 
 For the user-invoked no-console path, close the first window and double-click:
 
@@ -73,17 +87,17 @@ The unit suite additionally creates a temporary direct `.py` argument, verifies 
 - For “同意 / 本次”, “停止”, and “拒绝”, verify distinct default, hover, pressed, keyboard-focus, and disabled states with smooth antialiased edges in both themes. With Accessibility Insights or Narrator, verify each is exposed as a named Button with the correct enabled state and Invoke action; invoking a disabled control must fail, and invoking an enabled control must execute exactly once.
 - Resolve or reject every pending request. The relay must release topmost state after the pending count reaches zero.
 - With “新请求提示音” enabled, each newly created request should sound once; polling or repainting the same request must stay silent. Disable the option, submit another request, and verify silence. Restart the relay and verify that the sound choice persisted.
-- Open “诊断”. Verify the pane scrolls, copies successfully, reports the current Broker/connector version and exact build ID, runtime mode, protocol, plugin enabled state, cache/shortcut state, elevation, Job Object support, and a derived connector fingerprint. It must not include the endpoint bearer value, a `claim_token`, request body/output, or raw connector instance ID.
+- Open “接入检查”. Verify the pane scrolls, refreshes, copies successfully, and reports the current Broker/connector version and exact build ID, runtime mode, protocol, plugin enabled state, cache/shortcut state, elevation, actual Job Object creation capability, and a derived connector fingerprint. Missing or conflicting config is unknown, never `None` or falsely disabled. A historical matching connector must not imply the current chat is integrated. It must not include the endpoint bearer value, a `claim_token`, request body/output, or raw connector instance ID.
 
-## 8. Fixed polling and immediate stop
+## 8. Short polling, monotonic validity and immediate stop
 
-- Verify the header shows `等待 900秒 × 10次`, with no editable poll inputs or save control. Put old poll values in `ui-settings.json`, restart, and verify they are ignored while the sound preference still persists.
+- Verify the header shows the 9,000-second validity cap, with no editable poll-policy inputs. Put old poll values in `ui-settings.json`, restart, and verify they are ignored while the sound preference still persists.
 - Start the broker once from an elevated user-controlled terminal only for this review. There must be no red privilege banner, but a command request detail must state `执行权限: 管理员（获批命令将继承此权限）`. Close it before continuing ordinary-privilege tests.
-- Create a request and verify its frozen policy is exactly 900 seconds, 10 pending polls, 9,000 seconds validity, and a 9,000-second derived command timeout.
-- Call `wait_for_authorization` with any positive value other than the frozen per-call wait. Verify the broker still uses 900 seconds and the response's `polling.next_arguments` repeats 900; only zero performs an immediate, non-consuming read.
-- Use positive pending waits until the frozen count is exhausted and verify the request becomes `expired`; zero-wait reads must not consume the count.
-- Approve a command before its pending count is exhausted. Verify later waits do not terminate it because of the pending counter and that its frozen command timeout equals the original poll-duration × poll-count product.
-- While one 900-second wait is active on a pending card, click the window's “停止”. The call must return promptly with `state=cancelled` and `reason_code=stopped_by_user`, without waiting for the 900-second deadline. Verify no approval reply and no rejection receipt is produced. The control must be disabled for approved or running commands.
+- Create a request and verify its frozen caps are 9,000 seconds pending validity and 9,000 seconds command execution time; explicit caller values may shorten them. Poll count is informational and `pending_polls_remaining` is null.
+- Verify MCP waits default to 30 seconds and accept 0–900 seconds. The selected wait must appear unchanged in `polling.next_arguments`; zero reads immediately.
+- Perform more than 10 repeated and concurrent short waits. The request must remain pending until its original monotonic deadline, with no deadline extension. Use an isolated test clock to verify expiry without a long-running wait.
+- Approve a command before its pending deadline. Verify later polls do not terminate it based on their count; execution uses its independent frozen timeout after startup, excluding queue time.
+- While one 900-second wait is active on a pending card, click the window's “停止”. The call must return promptly with `state=cancelled` and `reason_code=stopped_by_user`, without waiting for the 900-second deadline. Verify no approval reply and no rejection receipt is produced. An approved command must instead expose a separate “终止” action and confirmation dialog.
 
 ## 9. Concurrent-project claim isolation
 
@@ -91,7 +105,7 @@ The unit suite additionally creates a temporary direct `.py` argument, verifies 
 - Give the two clients distinct project/task labels and confirm the newest card automatically shows the right human-readable origin plus a different connector fingerprint. Treat those values as weak evidence only: the claim token must remain the enforced isolation boundary.
 - Reject one card and approve the other. Each terminal must receive only the terminal state of its own request; neither may attach to the other card merely because both use the same shared Broker window.
 - The unit suite must retain negative coverage proving that a request ID with no token or a wrong token gets `claim_mismatch`, that public snapshots contain no raw token/connector ID, and that the same idempotency key in two connector-instance namespaces creates two independent requests.
-- Cancel one active MCP tool call from Desktop during a live integration run. Because the connector reads stdin synchronously, its cancellation notification may remain delayed for the full 900-second broker wait. Do not confuse this with the relay-window “停止” path above. If the notification is eventually read, a still-pending card becomes cancelled; an already approved/running command must not be killed.
+- Cancel one active MCP tool call from Desktop during a live integration run. The connector must read the notification during a long wait, stop waiting, and attempt cancellation using the original claim. Verify the reported Broker cancellation acknowledgement, rather than treating socket interruption as proof. Cancellation racing with approval must not kill an already approved/running command. A separate explicit `terminate_command` may terminate that request only with its matching claim.
 
 ## 10. Scope and window-lifecycle recovery
 
@@ -109,7 +123,7 @@ The unit suite additionally creates a temporary direct `.py` argument, verifies 
 
 ## 11. Codex plugin integration
 
-Plugin installation, Codex restart, and live MCP integration are separate client-impacting actions. Do not perform them as part of the source/unit smoke tests. When explicitly authorized, install the protocol-5 client plugin and window runtime from the same exact build, start the window manually, call \`relay_health\`, then test \`request_consent\` before testing the fixed print command. Health must report matching connector/Broker versions and build IDs. For the pull-loop check, use one separately reviewed fixed command that remains running longer than the frozen per-call wait: Codex must follow each response's exact `polling.next_arguments`, including the same request ID and claim token, until the terminal result, without asking the user to send an extra completion message.
+Plugin installation, Codex restart, and live MCP integration are separate client-impacting actions. Do not perform them as part of the source/unit smoke tests. When explicitly authorized, install the protocol-7 client plugin and window runtime from the same exact build, start the window manually, call \`relay_health\`, then test \`request_consent\` before testing the fixed print command. Health must report matching connector/Broker versions and build IDs. For the pull-loop check, use one separately reviewed fixed command that remains running longer than the frozen per-call wait: Codex must follow each response's exact `polling.next_arguments`, including the same request ID and claim token, until the terminal result, without asking the user to send an extra completion message.
 
 For the lifecycle panel, first verify that any active Codex/ChatGPT task or pending/running relay request disables “安全重启 Codex”. Simulate unsupported schema, partial sources, a full 50-row non-pinned result, an unknown status, stale inventory, and a non-Codex named-pipe owner; each case must keep restart disabled. Only under a separately explicit live-restart authorization, let every task become idle and click once: the window must acquire its intake gate, refresh inventory, send normal close, refuse force termination on timeout, and relaunch the exact validated Codex Desktop executable. The source/unit tests must mock or stop before the real close/relaunch step.
 
@@ -119,13 +133,13 @@ In a fresh Windows checkout or disposable VM, with Python available only for the
 
     python -m pip install -r requirements-build.txt
     python scripts\build_windows_release.py
-    python scripts\verify_windows_release.py dist\golden-finger-0.2.0
+    python scripts\verify_windows_release.py dist\golden-finger-0.3.1
 
-The verifier must recalculate every manifest hash, require the shared PyInstaller onedir layout and sibling `bin\golden-finger.runtime` directory, initialize `bin\golden-finger-mcp.exe`, and run `bin\GoldenFinger.exe --self-test-output ...` without opening the GUI. Both EXE paths remain unchanged; both EXEs must report version `0.2.0`, the identical stamped `rel-…` build ID, and self-contained mode; the Broker probe must successfully create a Windows Job Object.
+The verifier must recalculate every manifest hash, require the shared PyInstaller onedir layout and sibling `bin\golden-finger.runtime` directory, initialize `bin\golden-finger-mcp.exe`, and run `bin\GoldenFinger.exe --self-test-output ...` without opening the GUI. Broker and MCP must report the version from `release_metadata.VERSION` and the identical stamped `rel-…` build ID in self-contained mode; the Broker probe must successfully create a Windows Job Object. The package must also contain `bin\GoldenFingerSetup.exe`, complete original README assets, and installation instructions. Tests on Python 3.13 and 3.14 precede one canonical Python 3.13 build; tag publishing uses that same verified artifact.
 
 Copy the complete built package, including `bin\golden-finger.runtime`, to a clean Windows user account with no Python on PATH; copying either EXE by itself is unsupported. Launch `bin\GoldenFinger.exe` manually and verify the window appears. Point the package's `.mcp.json` at `bin\golden-finger-mcp.exe` through the separately authorized installation flow, restart/open a new Codex task as required, then repeat health and consent smoke checks. Confirm no build directory, source interpreter, developer checkout, or user-level Python dependency is required at runtime.
 
-The GitHub Actions `Windows release verification` workflow must pass from a clean checkout and upload only `golden-finger-0.2.0-windows-x64.zip`. Publishing that artifact, installing it, changing shortcuts, or replacing a running window remains a separate explicit action.
+The GitHub Actions `Windows release verification` workflow must pass from a clean checkout and upload only `golden-finger-0.3.1-windows-x64.zip`. Publishing that artifact, installing it, changing shortcuts, or replacing a running window remains a separate explicit action.
 
 ## 13. Automatic approval wait
 
@@ -135,3 +149,16 @@ The GitHub Actions `Windows release verification` workflow must pass from a clea
 - Submit two consent cards a few seconds apart and switch selection. Each card retains its own wait; selection does not move or reset another card's deadline. Manually approve, reject, stop, or cancel one before its deadline; its terminal decision must never be overwritten. Expired cards must not be approved.
 - Begin editing the parameter without applying it, open the detail overlay, hold a decision button pressed, or open the window-close confirmation. Automatic approval must pause and discard old timers; when interaction ends, every still-pending card receives a new complete wait. Invalid, fractional, negative, empty, or out-of-range input must not enable approval. A corrupt saved settings file disables automatic approval.
 - Check the wait input, apply button, status warning, and countdown in both themes and at the Snap minimum width. Restore the desired wait after testing; do not silently change a real running broker's preferences from tests.
+
+## 14. Isolated 0.3.1 packaged regressions
+
+After building, these checks use temporary installation roots, an isolated loopback Broker and current-user protected receipts. They never install into the user's existing root, modify Codex settings, approve a request or execute a business command. The MCP check starts the real packaged connector twice to verify recovery across process restart.
+
+```powershell
+$env:GOLDEN_FINGER_RELEASE_PACKAGE = (Resolve-Path dist/golden-finger-0.3.1).Path
+python -m unittest discover -s tests -p test_release_enhancements.py -v
+python tests/verify_mcp_release.py --package "$env:GOLDEN_FINGER_RELEASE_PACKAGE"
+Remove-Item Env:GOLDEN_FINGER_RELEASE_PACKAGE
+```
+
+The repair fixture damages only its own active Setup copy and active pointer, then verifies independent repair and recovery. The connector fixture checks exact-build readiness, progress during a pending call, cancellation, protected receipt recovery, and read-only preflight. Source unit tests cover bounded output paging, encodings, startup races and concurrent waits. Long-running soak tests remain deferred; these checks do not substitute for real multi-client, clean-machine or GUI interaction acceptance.

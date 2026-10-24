@@ -73,6 +73,7 @@ from codex_lifecycle import (
     parse_list_threads_payload,
 )
 import relay_mcp_server
+from relay_recovery import RecoveryJournal
 from relay_mcp_server import TOOLS, _polling_directive, handle_request
 from relay_protocol import (
     CLAIM_TOKEN_PREFIX,
@@ -684,7 +685,7 @@ class StoreTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertLessEqual(len(first), 132)
 
-    def test_fixed_policy_is_frozen_and_pending_poll_limit_expires(self) -> None:
+    def test_fixed_policy_is_frozen_and_only_total_deadline_expires(self) -> None:
         store = RequestStore(
             elevated=False,
             settings={
@@ -713,9 +714,15 @@ class StoreTests(unittest.TestCase):
         request_id = submitted["request_id"]
         with store._condition:
             store._records[request_id].pending_polls_used = 10
-        snapshot = store.wait(request_id, claim_token, 1)
-        self.assertEqual(snapshot["state"], "expired")
-        self.assertEqual(snapshot["poll_policy"]["pending_polls_used"], 10)
+        snapshot = store.wait(request_id, claim_token, 0.01)
+        self.assertEqual(snapshot["state"], "pending")
+        self.assertEqual(snapshot["poll_policy"]["pending_polls_used"], 11)
+        self.assertEqual(snapshot["poll_policy"]["expiry_basis"], "monotonic_deadline")
+        self.assertIsNone(snapshot["poll_policy"]["pending_polls_remaining"])
+        with store._condition:
+            store._records[request_id].expires_monotonic = time.monotonic() - 1
+            store._next_expiry_check_monotonic = 0
+        self.assertEqual(store.wait(request_id, claim_token, 0)["state"], "expired")
 
     def test_legacy_policy_inputs_are_ignored_in_favor_of_fixed_policy(self) -> None:
         policy = normalize_poll_policy(
@@ -1555,6 +1562,13 @@ class AppearanceTests(unittest.TestCase):
 
 
 class MCPShapeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        journal_patch = patch.object(relay_mcp_server, "recovery_journal", lambda thread, process: RecoveryJournal("thread:" + thread if thread else "process:" + process, root=Path(temporary.name)))
+        journal_patch.start()
+        self.addCleanup(journal_patch.stop)
+
     def test_tool_surface_has_no_approve_tool(self) -> None:
         names = {tool["name"] for tool in TOOLS}
         self.assertEqual(
@@ -1565,13 +1579,17 @@ class MCPShapeTests(unittest.TestCase):
                 "request_command_execution",
                 "wait_for_authorization",
                 "cancel_authorization",
+                "terminate_command",
+                "preflight_command",
+                "recover_authorization",
+                "read_command_output",
             },
         )
         self.assertFalse(any("approve" in name for name in names))
 
     def test_wait_and_cancel_require_the_per_request_claim(self) -> None:
         tools_by_name = {tool["name"]: tool for tool in TOOLS}
-        for name in ("wait_for_authorization", "cancel_authorization"):
+        for name in ("wait_for_authorization", "cancel_authorization", "terminate_command"):
             schema = tools_by_name[name]["inputSchema"]
             self.assertIn("request_id", schema["required"])
             self.assertIn("claim_token", schema["required"])
@@ -1580,8 +1598,8 @@ class MCPShapeTests(unittest.TestCase):
         self.assertEqual(
             tools_by_name["wait_for_authorization"]["inputSchema"]["properties"][
                 "wait_seconds"
-            ]["enum"],
-            [0, 900],
+            ]["default"],
+            30,
         )
 
     def test_new_request_schemas_require_cross_project_source_evidence(self) -> None:
@@ -1840,10 +1858,8 @@ class MCPShapeTests(unittest.TestCase):
                 rpc_request_id=77,
             )
         self.assertEqual(calls[0][0], "submit")
-        self.assertEqual(
-            calls[0][1]["client_instance_id"],
-            relay_mcp_server.CLIENT_INSTANCE_ID,
-        )
+        self.assertTrue(calls[0][1]["client_instance_id"].startswith("gfi_"))
+        self.assertNotEqual(calls[0][1]["client_instance_id"], relay_mcp_server.CLIENT_INSTANCE_ID)
         self.assertNotIn("client_instance_id", result["request"])
         self.assertEqual(result["claim_token"], TEST_CLAIM)
         self.assertEqual(
@@ -1851,7 +1867,7 @@ class MCPShapeTests(unittest.TestCase):
             {
                 "request_id": "gfr_BoundRequest",
                 "claim_token": TEST_CLAIM,
-                "wait_seconds": 17,
+                "wait_seconds": 0,
             },
         )
         relay_mcp_server._RPC_REQUEST_CLAIMS.clear()
@@ -1864,11 +1880,11 @@ class MCPShapeTests(unittest.TestCase):
                 "poll_policy": {
                     "wait_seconds": 12,
                     "pending_polls_used": 3,
-                    "pending_polls_remaining": 9,
+                    "remaining_seconds": 9,
                     "policy_revision": "test-policy",
                 },
             },
-            TEST_CLAIM,
+            TEST_CLAIM, 12,
         )
         self.assertFalse(active["terminal"])
         self.assertTrue(active["must_continue_current_turn"])
@@ -1881,7 +1897,7 @@ class MCPShapeTests(unittest.TestCase):
                 "wait_seconds": 12,
             },
         )
-        self.assertEqual(active["pending_polls_remaining"], 9)
+        self.assertEqual(active["remaining_seconds"], 9)
         self.assertTrue(active["do_not_wait_for_user_message"])
 
         fallback = _polling_directive(
@@ -1890,7 +1906,7 @@ class MCPShapeTests(unittest.TestCase):
         )
         self.assertEqual(
             fallback["next_arguments"]["wait_seconds"],
-            DEFAULT_POLL_WAIT_SECONDS,
+            relay_mcp_server.DEFAULT_MCP_WAIT_SECONDS,
         )
         self.assertEqual(DEFAULT_PENDING_POLL_CYCLES, 10)
 
@@ -1970,8 +1986,8 @@ class MCPShapeTests(unittest.TestCase):
         assert response is not None
         self.assertEqual(response["result"]["protocolVersion"], "2025-06-18")
         self.assertEqual(response["result"]["capabilities"], {"tools": {"listChanged": False}})
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.0")
-        self.assertEqual(PROTOCOL_VERSION, 5)
+        self.assertEqual(response["result"]["serverInfo"]["version"], PACKAGE_VERSION)
+        self.assertEqual(PROTOCOL_VERSION, 7)
 
 
 class ReleasePackagingTests(unittest.TestCase):

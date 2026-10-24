@@ -35,7 +35,14 @@ import unicodedata
 import zlib
 
 import tkinter as tk
-from tkinter import font as tkfont, messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk, filedialog
+
+# Release inventories are exact; source entrypoints must not add bytecode files.
+sys.dont_write_bytecode = True
+
+from relay_diagnostics import read_plugin_configuration, format_diagnostics
+from relay_preferences import load_preferences, save_preferences
+from relay_tray import TrayBridge
 
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageTk
@@ -50,7 +57,9 @@ from codex_lifecycle import (
     graceful_restart_codex,
     normalize_codex_thread_id,
 )
+from relay_execution import BoundedOutput, WindowsJob, decode_output, start_contained_process
 from relay_protocol import (
+    preflight_command,
     DEFAULT_PENDING_POLL_CYCLES,
     DEFAULT_POLL_WAIT_SECONDS,
     MAX_OUTPUT_BYTES,
@@ -66,12 +75,14 @@ from relay_protocol import (
     claim_fingerprint,
     endpoint_directory,
     fingerprint_executable,
+    fit_wire_response,
     verify_script_dependencies,
     json_ascii,
     new_bearer_token,
     new_claim_token,
     normalize_client_instance_id,
     normalize_request,
+    validate_recovery_token,
     remove_endpoint_if_owned,
     write_endpoint,
 )
@@ -81,6 +92,10 @@ BROKER_VERSION = PACKAGE_VERSION
 BROKER_BUILD_ID = RUNTIME_BUILD_ID
 TERMINAL_RETENTION_SECONDS = 3_600
 GUI_TERMINAL_HISTORY_LIMIT = 200
+MAX_RETAINED_REQUESTS = 512
+MAX_EXECUTION_WORKERS = 4
+MAX_CLIENT_CONNECTIONS = 32
+MAX_BLOCKING_WAITS = 16
 WINDOW_BACKGROUND_OPACITY = 0.60
 WINDOW_CONTENT_OPACITY = 1.0
 WINDOW_TRANSPARENT_COLOR = "#010203"
@@ -111,6 +126,7 @@ TERMINAL_STATES = {
     "completed",
     "failed",
     "timed_out",
+    "terminated",
 }
 
 
@@ -1698,134 +1714,6 @@ class SingleInstanceLock:
         self._handle = None
 
 
-class _JobObjectBasicLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("PerProcessUserTimeLimit", ctypes.c_longlong),
-        ("PerJobUserTimeLimit", ctypes.c_longlong),
-        ("LimitFlags", wintypes.DWORD),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", wintypes.DWORD),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", wintypes.DWORD),
-        ("SchedulingClass", wintypes.DWORD),
-    ]
-
-
-class _IoCounters(ctypes.Structure):
-    _fields_ = [
-        ("ReadOperationCount", ctypes.c_ulonglong),
-        ("WriteOperationCount", ctypes.c_ulonglong),
-        ("OtherOperationCount", ctypes.c_ulonglong),
-        ("ReadTransferCount", ctypes.c_ulonglong),
-        ("WriteTransferCount", ctypes.c_ulonglong),
-        ("OtherTransferCount", ctypes.c_ulonglong),
-    ]
-
-
-class _JobObjectExtendedLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
-        ("IoInfo", _IoCounters),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    ]
-
-
-class WindowsJob:
-    """Own a Windows process tree and kill it when the handle is closed."""
-
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
-
-    def __init__(self, handle: int | None) -> None:
-        self._handle = handle
-
-    @classmethod
-    def create(cls) -> "WindowsJob":
-        if os.name != "nt":
-            return cls(None)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-        kernel32.SetInformationJobObject.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-        ]
-        kernel32.SetInformationJobObject.restype = wintypes.BOOL
-        handle = kernel32.CreateJobObjectW(None, None)
-        if not handle:
-            raise RelayError(
-                "job_object_failed",
-                "Windows could not create a process-tree containment job.",
-                details={"winerror": ctypes.get_last_error()},
-            )
-        job = cls(int(handle))
-        information = _JobObjectExtendedLimitInformation()
-        information.BasicLimitInformation.LimitFlags = (
-            cls.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        )
-        if not kernel32.SetInformationJobObject(
-            wintypes.HANDLE(job._handle),
-            cls.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-            ctypes.byref(information),
-            ctypes.sizeof(information),
-        ):
-            error = ctypes.get_last_error()
-            job.close()
-            raise RelayError(
-                "job_object_failed",
-                "Windows could not configure process-tree containment.",
-                details={"winerror": error},
-            )
-        return job
-
-    @property
-    def active(self) -> bool:
-        return self._handle is not None
-
-    def assign(self, process: subprocess.Popen[bytes]) -> None:
-        if self._handle is None:
-            return
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-        process_handle = int(getattr(process, "_handle"))
-        if not kernel32.AssignProcessToJobObject(
-            wintypes.HANDLE(self._handle),
-            wintypes.HANDLE(process_handle),
-        ):
-            raise RelayError(
-                "job_assignment_failed",
-                "The approved process could not be contained in a Windows Job Object.",
-                details={"winerror": ctypes.get_last_error()},
-            )
-
-    def terminate(self, exit_code: int = 1) -> None:
-        if self._handle is None:
-            return
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-        kernel32.TerminateJobObject.restype = wintypes.BOOL
-        if not kernel32.TerminateJobObject(
-            wintypes.HANDLE(self._handle),
-            wintypes.UINT(exit_code),
-        ):
-            raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")
-
-    def close(self) -> None:
-        if self._handle is None:
-            return
-        handle = self._handle
-        self._handle = None
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
 @dataclass
@@ -1848,6 +1736,12 @@ class RequestRecord:
     pending_polls_used: int = 0
     process: subprocess.Popen[bytes] | None = field(default=None, repr=False)
     process_job: WindowsJob | None = field(default=None, repr=False)
+    execution_phase: str | None = None
+    termination_reason: str | None = None
+    execution_group: str | None = field(default=None, repr=False)
+    execution_order: int = field(default=0, repr=False)
+    output_buffers: dict[str, BoundedOutput] = field(default_factory=dict, repr=False)
+    output_changed_at: float = field(default=0.0, repr=False)
 
     @property
     def kind(self) -> str:
@@ -1873,17 +1767,26 @@ class RequestRecord:
             "poll_policy": {
                 **self.frozen["poll_policy"],
                 "pending_polls_used": self.pending_polls_used,
-                "pending_polls_remaining": max(
-                    0,
-                    int(self.frozen["poll_policy"]["max_pending_polls"])
-                    - self.pending_polls_used,
-                ),
+                "pending_polls_remaining": None,
+                "expiry_basis": "monotonic_deadline",
+                "remaining_seconds": max(0, math.ceil(self.expires_monotonic - time.monotonic()))
+                if self.state == "pending" else None,
             },
         }
         if self.receipt is not None:
             snapshot["receipt"] = dict(self.receipt)
+        if self.execution_phase is not None:
+            snapshot["execution_phase"] = self.execution_phase
         if self.result is not None:
             snapshot["result"] = dict(self.result)
+        if self.output_buffers:
+            encoding = self.frozen.get("output_encoding", "auto")
+            summaries = {name: buffer.summary() for name, buffer in self.output_buffers.items()}
+            snapshot["output_summary"] = summaries
+            snapshot["output_revision"] = sum(value["total_bytes"] for value in summaries.values())
+            if self.state == "running":
+                for name, buffer in self.output_buffers.items():
+                    snapshot[name + "_tail"] = buffer.tail_text(encoding)
         return snapshot
 
 
@@ -1893,6 +1796,7 @@ class RequestStore:
         self._condition = threading.Condition(threading.RLock())
         self._records: OrderedDict[str, RequestRecord] = OrderedDict()
         self._idempotency: dict[tuple[str, str], str] = {}
+        self._recovery_claims: dict[str, tuple[str, str]] = {}
         self._shutting_down = False
         self._restart_pending = False
         self._poll_policy = normalize_poll_policy(settings or default_ui_settings())
@@ -1901,6 +1805,180 @@ class RequestStore:
         self._gui_cache_rows: tuple[dict[str, Any], ...] = ()
         self._gui_cache_counts = (0, 0)
         self._next_expiry_check_monotonic = 0.0
+        self._execution_slots: dict[str, str] = {}
+        self._group_resolution_slots: set[str] = set()
+        self._execution_queue_sequence = 0
+
+    @staticmethod
+    def _execution_group(record: RequestRecord) -> str:
+        # Infer repository identity from the actual validated cwd, never the
+        # caller's display-only project. Subdirectories share their Git root;
+        # non-repositories serialize by directory.
+        directory = Path(os.path.realpath(record.frozen["working_directory"]))
+        for candidate in (directory, *directory.parents):
+            try:
+                if (candidate / ".git").exists():
+                    return os.path.normcase(str(candidate))
+            except OSError:
+                break
+        return os.path.normcase(str(directory))
+
+    def _schedule_execution_locked(self) -> None:
+        if self._shutting_down:
+            return
+        # approve_from_gui invokes this under the same lock immediately after
+        # queueing. Remember approval order rather than submission order or the
+        # order in which asynchronous directory probes happen to finish.
+        for record in self._records.values():
+            if record.state == "running" and record.execution_phase == "queued" and not record.execution_order:
+                self._execution_queue_sequence += 1
+                record.execution_order = self._execution_queue_sequence
+        queued = sorted(
+            (record for record in self._records.values()
+             if record.state == "running" and record.execution_phase == "queued"),
+            key=lambda record: record.execution_order,
+        )
+        # Resolving network paths or Git ancestors can block. Only reserve a
+        # bounded resolver here; disk work runs outside the shared state lock.
+        for record in queued:
+            if len(self._group_resolution_slots) >= MAX_EXECUTION_WORKERS:
+                break
+            if (record.state != "running" or record.execution_phase != "queued"
+                    or record.execution_group is not None
+                    or record.request_id in self._group_resolution_slots):
+                continue
+            self._group_resolution_slots.add(record.request_id)
+            resolver = threading.Thread(
+                target=self._resolve_execution_group, args=(record,),
+                daemon=True, name=f"relay-group-{record.request_id[-8:]}",
+            )
+            try:
+                resolver.start()
+            except RuntimeError:
+                self._group_resolution_slots.discard(record.request_id)
+                record.state = "failed"
+                record.execution_phase = "finished"
+                record.terminal_monotonic = time.monotonic()
+                record.result = {"decision": "approved", "reason_code": "worker_start_failed"}
+                self._mark_gui_changed_locked()
+        unresolved: list[RequestRecord] = []
+        for record in queued:
+            if len(self._execution_slots) >= MAX_EXECUTION_WORKERS:
+                break
+            if record.state != "running" or record.execution_phase != "queued":
+                continue
+            group = record.execution_group
+            if group is None:
+                unresolved.append(record)
+                continue
+            # An earlier approved cwd inside this known group may still be
+            # resolving. Do not let a faster probe overtake it. This comparison
+            # uses already-normalized path strings only; unrelated directories
+            # remain eligible without waiting for a slow disk probe.
+            if any(self._directory_in_group(earlier.frozen["working_directory"], group) for earlier in unresolved):
+                continue
+            if group in self._execution_slots.values():
+                continue
+            self._execution_slots[record.request_id] = group
+            record.execution_phase = "starting"
+            record.updated_at = iso_timestamp()
+            worker = threading.Thread(
+                target=self._execution_worker,
+                args=(record.request_id,),
+                name=f"relay-exec-{record.request_id[-8:]}",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except RuntimeError:
+                self._execution_slots.pop(record.request_id, None)
+                record.execution_phase = "finished"
+                record.state = "failed"
+                record.terminal_monotonic = time.monotonic()
+                record.result = {"decision": "approved", "reason_code": "worker_start_failed"}
+            self._mark_gui_changed_locked()
+
+    @staticmethod
+    def _directory_in_group(directory: str, group: str) -> bool:
+        try:
+            return os.path.commonpath((os.path.normcase(directory), group)) == group
+        except ValueError:
+            return False  # Different Windows drives cannot share this group.
+
+    def _resolve_execution_group(self, record: RequestRecord) -> None:
+        try:
+            group = self._execution_group(record)
+        except Exception:
+            self._finish_execution(
+                record.request_id, state="failed", message="The execution directory could not be inspected.",
+                result={"reason_code": "execution_group_failed"},
+            )
+        else:
+            with self._condition:
+                if record.state == "running" and record.execution_phase == "queued":
+                    record.execution_group = group
+        finally:
+            with self._condition:
+                self._group_resolution_slots.discard(record.request_id)
+                self._schedule_execution_locked()
+
+    def _execution_worker(self, request_id: str) -> None:
+        try:
+            self._execute_command(request_id)
+        except Exception:
+            self._finish_execution(
+                request_id,
+                state="failed",
+                message="The execution worker encountered an unexpected error.",
+                result={"reason_code": "execution_worker_failed"},
+            )
+        finally:
+            with self._condition:
+                record = self._records.get(request_id)
+                if record is not None and record.state in TERMINAL_STATES:
+                    record.execution_phase = "finished"
+                    self._mark_gui_changed_locked()
+                self._execution_slots.pop(request_id, None)
+                self._schedule_execution_locked()
+
+    def _trim_history_locked(self) -> None:
+        """Cap retained payloads as well as visible history; never evict live work."""
+        while len(self._records) >= MAX_RETAINED_REQUESTS:
+            removable = next(
+                (key for key, record in self._records.items() if record.state in TERMINAL_STATES),
+                None,
+            )
+            if removable is None:
+                raise RelayError("queue_full", "The retained request capacity has been reached.")
+            record = self._records.pop(removable)
+            key = (record.client_instance_id, str(record.frozen["idempotency_key"]))
+            if self._idempotency.get(key) == removable:
+                del self._idempotency[key]
+            self._recovery_claims = {key: value for key, value in self._recovery_claims.items() if value[1] != removable}
+            self._mark_gui_changed_locked()
+
+    def audit_snapshot(self) -> list[dict[str, Any]]:
+        """Return an explicit-export summary without command text, output or tokens."""
+        with self._condition:
+            self._expire_locked()
+            return [
+                {
+                    "request_id": record.request_id,
+                    "request_fingerprint": record.request_hash[:12],
+                    "created_at": record.created_at,
+                    "updated_at": record.updated_at,
+                    "kind": record.kind,
+                    "state": record.state,
+                    "execution_phase": record.execution_phase,
+                    "approval_mode": (record.receipt or {}).get("approval_mode"),
+                    "exit_code": (record.result or {}).get("exit_code"),
+                    "reason_code": (record.result or {}).get("reason_code"),
+                    "project_fingerprint": canonical_hash(
+                        record.frozen.get("working_directory", record.frozen.get("source_project", ""))
+                    )[:12],
+                }
+                for record in self._records.values()
+            ]
 
     def current_poll_policy(self) -> dict[str, Any]:
         with self._condition:
@@ -2048,6 +2126,7 @@ class RequestStore:
             if self._idempotency.get(key) == request_id:
                 del self._idempotency[key]
         if removable:
+            self._recovery_claims = {key: value for key, value in self._recovery_claims.items() if value[1] in self._records}
             next_check = float("inf")
             for record in self._records.values():
                 if record.state == "pending":
@@ -2067,7 +2146,14 @@ class RequestStore:
         payload: Any,
         client_instance_id: Any,
         codex_thread_id: Any = None,
+        recovery_token: Any = None,
+        payload_hash: Any = None,
     ) -> tuple[dict[str, Any], bool, str]:
+        recovery_key = None
+        if recovery_token is not None or payload_hash is not None:
+            recovery_key = self._recovery_key(recovery_token, payload_hash)
+            if payload_hash != canonical_hash({"kind": kind, "payload": payload}):
+                raise RelayError("payload_hash_mismatch", "The submission payload does not match its recovery hash.")
         normalized_client_instance_id = normalize_client_instance_id(
             client_instance_id
         )
@@ -2079,6 +2165,14 @@ class RequestStore:
         )[:12]
         frozen["request_hash"] = canonical_hash(frozen)
         with self._condition:
+            self._recovery_claims = {
+                key: value for key, value in self._recovery_claims.items() if value[1] in self._records
+            }
+            if recovery_key in self._recovery_claims:
+                recovered = self._recover_locked(recovery_key, payload_hash)
+                return recovered["request"], True, recovered["claim_token"]
+            if recovery_key is not None and len(self._recovery_claims) >= MAX_RETAINED_REQUESTS * 2:
+                raise RelayError("recovery_capacity", "The retained recovery capability capacity is full.")
             if self._shutting_down:
                 raise RelayError("broker_stopping", "The relay window is stopping.")
             if self._restart_pending:
@@ -2107,6 +2201,8 @@ class RequestStore:
                     ):
                         existing.codex_thread_id = normalized_codex_thread_id
                         self._mark_gui_changed_locked()
+                    if recovery_key is not None:
+                        self._recovery_claims[recovery_key] = (payload_hash, existing.request_id)
                     return existing.public_snapshot(), True, existing.claim_token
 
             self._ensure_gui_cache_locked()
@@ -2116,6 +2212,7 @@ class RequestStore:
                     "queue_full",
                     "The relay already has too many active requests.",
                 )
+            self._trim_history_locked()
 
             created = utc_now()
             expires = created + timedelta(seconds=frozen["expires_in_seconds"])
@@ -2137,8 +2234,32 @@ class RequestStore:
             )
             self._records[request_id] = record
             self._idempotency[idempotency_scope] = request_id
+            if recovery_key is not None:
+                self._recovery_claims[recovery_key] = (payload_hash, request_id)
             self._mark_gui_changed_locked()
             return record.public_snapshot(), False, claim_token
+
+    @staticmethod
+    def _recovery_key(recovery_token: Any, payload_hash: Any) -> str:
+        token = validate_recovery_token(recovery_token)
+        if not isinstance(payload_hash, str) or len(payload_hash) != 64 or any(c not in "0123456789abcdef" for c in payload_hash):
+            raise RelayError("invalid_payload_hash", "A recovery request requires the exact SHA-256 payload hash.")
+        return canonical_hash(token)
+
+    def _recover_locked(self, recovery_key: str, payload_hash: str) -> dict[str, Any]:
+        self._expire_locked()
+        saved = self._recovery_claims.get(recovery_key)
+        if saved is None or saved[1] not in self._records:
+            raise RelayError("recovery_not_found", "No retained request matches this recovery capability; do not automatically resubmit.")
+        if not secrets.compare_digest(saved[0], payload_hash):
+            raise RelayError("claim_mismatch", "The recovery capability does not match this payload.")
+        record = self._records[saved[1]]
+        return {"ok": True, "request": record.public_snapshot(), "claim_token": record.claim_token, "idempotent_replay": True}
+
+    def recover(self, recovery_token: Any, payload_hash: Any) -> dict[str, Any]:
+        key = self._recovery_key(recovery_token, payload_hash)
+        with self._condition:
+            return self._recover_locked(key, payload_hash)
 
     def _get_locked(self, request_id: Any) -> RequestRecord:
         if not isinstance(request_id, str) or not request_id.startswith(REQUEST_ID_PREFIX):
@@ -2182,21 +2303,11 @@ class RequestStore:
             raise RelayError("invalid_wait", "wait_seconds must be a number.")
         with self._condition:
             record = self._get_claimed_locked(request_id, claim_token)
-            policy = record.frozen["poll_policy"]
             requested_wait = float(wait_seconds)
-            bounded_wait = (
-                float(policy["wait_seconds"])
-                if requested_wait > 0
-                else 0.0
-            )
+            if not math.isfinite(requested_wait) or not 0 <= requested_wait <= 900:
+                raise RelayError("invalid_wait", "wait_seconds must be between 0 and 900.")
+            bounded_wait = requested_wait
             if record.state == "pending" and bounded_wait > 0:
-                if record.pending_polls_used >= int(policy["max_pending_polls"]):
-                    self._expire_pending_locked(
-                        record,
-                        message="The configured pending polling limit was reached.",
-                    )
-                    self._mark_gui_changed_locked()
-                    return record.public_snapshot()
                 record.pending_polls_used += 1
                 self._mark_gui_changed_locked()
             deadline = time.monotonic() + bounded_wait
@@ -2207,16 +2318,6 @@ class RequestStore:
                 next_expiry = max(0.0, record.expires_monotonic - time.monotonic())
                 self._condition.wait(timeout=min(remaining, next_expiry or remaining))
                 record = self._get_claimed_locked(request_id, claim_token)
-            if (
-                record.state == "pending"
-                and bounded_wait > 0
-                and record.pending_polls_used >= int(policy["max_pending_polls"])
-            ):
-                self._expire_pending_locked(
-                    record,
-                    message="The configured pending polling limit was reached.",
-                )
-                self._mark_gui_changed_locked()
             return record.public_snapshot()
 
     def cancel(self, request_id: Any, claim_token: Any) -> dict[str, Any]:
@@ -2268,6 +2369,53 @@ class RequestStore:
             }
             self._mark_gui_changed_locked()
             return record.public_snapshot()
+
+    def terminate(self, request_id: Any, claim_token: Any) -> dict[str, Any]:
+        with self._condition:
+            record = self._get_claimed_locked(request_id, claim_token)
+            return self._terminate_locked(record)
+
+    def terminate_from_gui(self, request_id: str) -> dict[str, Any]:
+        with self._condition:
+            return self._terminate_locked(self._get_locked(request_id))
+
+    def _terminate_locked(self, record: RequestRecord) -> dict[str, Any]:
+        if record.state == "pending":
+            raise RelayError("not_started", "Cancel the pending request instead of terminating execution.")
+        if record.state != "running":
+            return record.public_snapshot()
+        if record.termination_reason is not None:
+            return record.public_snapshot()
+        if record.process is not None and record.process.poll() is not None:
+            # The worker is collecting output; an already-exited process must
+            # not be relabeled as a successful user termination.
+            return record.public_snapshot()
+        if record.process is not None:
+            try:
+                if record.process_job is not None and record.process_job.active:
+                    record.process_job.terminate(1)
+                else:
+                    record.process.terminate()
+            except OSError as exc:
+                raise RelayError("termination_failed", "The running command could not be terminated.") from exc
+        record.termination_reason = "terminated_by_user"
+        record.updated_at = iso_timestamp()
+        if record.execution_phase == "queued":
+            record.state = "terminated"
+            record.execution_phase = "finished"
+            record.terminal_monotonic = time.monotonic()
+            record.result = {
+                "decision": "approved",
+                "reason_code": "terminated_by_user",
+                "message": "The user removed the approved command from the execution queue.",
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+            }
+        else:
+            record.execution_phase = "terminating"
+        self._mark_gui_changed_locked()
+        return record.public_snapshot()
 
     def reject_from_gui(self, request_id: str) -> dict[str, Any]:
         with self._condition:
@@ -2340,14 +2488,9 @@ class RequestStore:
                 return record.public_snapshot()
 
             record.state = "running"
+            record.execution_phase = "queued"
             self._mark_gui_changed_locked()
-            worker = threading.Thread(
-                target=self._execute_command,
-                args=(record.request_id,),
-                name=f"relay-exec-{record.request_id[-8:]}",
-                daemon=True,
-            )
-            worker.start()
+            self._schedule_execution_locked()
             return record.public_snapshot()
 
     def _finish_execution(
@@ -2363,7 +2506,16 @@ class RequestStore:
             record = self._records.get(request_id)
             if record is None:
                 return
+            if record.termination_reason is not None:
+                state = "terminated" if record.termination_reason == "terminated_by_user" else "cancelled"
+                message = (
+                    "The user terminated the approved command."
+                    if record.termination_reason == "terminated_by_user"
+                    else "The relay window closed during execution."
+                )
+                result = {**(result or {}), "reason_code": record.termination_reason}
             record.state = state
+            record.execution_phase = "finished"
             record.updated_at = iso_timestamp()
             record.terminal_monotonic = time.monotonic()
             record.process = None
@@ -2374,50 +2526,76 @@ class RequestStore:
                 "message": message,
                 **(result or {}),
             }
+            for output in record.output_buffers.values():
+                output.finish()
             self._mark_gui_changed_locked()
         if job is not None:
             job.close()
 
-    @staticmethod
+    def read_output(
+        self, request_id: Any, claim_token: Any, stream: str = "stdout",
+        offset: int = 0, limit: int = 16_384,
+    ) -> dict[str, Any]:
+        if not isinstance(stream, str) or stream not in {"stdout", "stderr"}:
+            raise RelayError("invalid_output_stream", "Output stream must be stdout or stderr.")
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 65_536:
+            raise RelayError("invalid_output_range", "Output requires offset >= 0 and a byte limit of 1–65536.")
+        with self._condition:
+            record = self._get_claimed_locked(request_id, claim_token)
+            if record.kind != "command":
+                raise RelayError("invalid_request_kind", "Only command requests have output.")
+            buffer = record.output_buffers.get(stream)
+            state = record.state
+            phase = record.execution_phase
+            encoding = record.frozen.get("output_encoding", "auto")
+        if buffer is None:
+            buffer = BoundedOutput()
+            if state in TERMINAL_STATES:
+                buffer.finish()
+        page = buffer.page(offset, limit, encoding)
+        return {"request_id": request_id, "state": state, "execution_phase": phase, "stream": stream, **page}
+
+    def _output_changed(self, request_id: str, *, force: bool = False) -> None:
+        with self._condition:
+            record = self._records.get(request_id)
+            now = time.monotonic()
+            if record is not None and (force or now - record.output_changed_at >= 0.25):
+                record.output_changed_at = now
+                self._mark_gui_changed_locked(expiry_changed=False)
+
     def _drain_stream(
-        stream: BinaryIO,
-        retained: bytearray,
-        truncated: list[bool],
+        self, request_id: str, stream: BinaryIO, retained: BoundedOutput,
     ) -> None:
         try:
             while True:
-                chunk = stream.read(8_192)
+                # BufferedReader.read waits to fill the entire size. read1 lets
+                # short progress lines become visible while the child runs.
+                chunk = getattr(stream, "read1", stream.read)(8_192)
                 if not chunk:
                     break
-                remaining = MAX_OUTPUT_BYTES - len(retained)
-                if remaining > 0:
-                    retained.extend(chunk[:remaining])
-                if len(chunk) > remaining:
-                    truncated[0] = True
+                retained.append(chunk)
+                self._output_changed(request_id)
         finally:
+            retained.finish()
+            self._output_changed(request_id, force=True)
             try:
                 stream.close()
             except OSError:
                 pass
 
     @staticmethod
-    def _decode_output(data: bytes) -> tuple[str, str]:
-        if not data:
-            return "", "utf-8"
-        candidates = ["utf-8-sig", locale.getpreferredencoding(False)]
-        for encoding in candidates:
-            if not encoding:
-                continue
-            try:
-                return data.decode(encoding), encoding
-            except (UnicodeDecodeError, LookupError):
-                continue
-        return data.decode("utf-8", errors="replace"), "utf-8-replacement"
+    def _decode_output(
+        data: bytes, encoding: str = "auto", *, truncated: bool = False,
+    ) -> tuple[str, str]:
+        return decode_output(data, encoding, truncated=truncated)
 
     def _execute_command(self, request_id: str) -> None:
         with self._condition:
             record = self._records.get(request_id)
             if record is None or record.state != "running":
+                return
+            if record.termination_reason is not None:
+                self._finish_execution(request_id, state="terminated", message="Execution stopped before startup.")
                 return
             if self._shutting_down:
                 record.state = "cancelled"
@@ -2476,117 +2654,74 @@ class RequestStore:
             )
             return
 
+        output_buffers = {"stdout": BoundedOutput(), "stderr": BoundedOutput()}
         with self._condition:
             record = self._records.get(request_id)
             if record is None or record.state != "running":
                 return
-            if self._shutting_down:
-                record.state = "cancelled"
-                record.updated_at = iso_timestamp()
-                record.terminal_monotonic = time.monotonic()
-                record.result = {
-                    "decision": "approved",
-                    "message": "The window closed before the approved process was created.",
-                }
-                self._mark_gui_changed_locked()
+            if self._shutting_down and record.termination_reason is None:
+                record.termination_reason = "relay_window_closed"
+            if record.termination_reason is not None:
+                self._finish_execution(request_id, state="terminated", message="Execution stopped before startup.")
                 return
-            command = [frozen["executable"], *frozen["arguments"]]
-            try:
-                process_job = WindowsJob.create()
-            except RelayError as exc:
-                record.state = "failed"
-                record.updated_at = iso_timestamp()
-                record.terminal_monotonic = time.monotonic()
-                record.result = {
-                    "decision": "approved",
-                    "message": f"Process containment failed: {exc.message}",
-                    "error": exc.as_dict()["error"],
-                }
+            record.output_buffers = output_buffers
+
+        # Job creation, CreateProcess and thread enumeration can block in the OS.
+        # Publish only a suspended, already-contained child under the state lock;
+        # shutdown/terminate either rejects that publication or kills this job.
+        try:
+            process_job = WindowsJob.create()
+        except RelayError as exc:
+            self._finish_execution(
+                request_id, state="failed", message=f"Process containment failed: {exc.message}",
+                result={"error": exc.as_dict()["error"]},
+            )
+            return
+
+        def before_resume(process: subprocess.Popen[bytes]) -> bool:
+            with self._condition:
+                current = self._records.get(request_id)
+                if current is None or current.state != "running":
+                    return False
+                if self._shutting_down and current.termination_reason is None:
+                    current.termination_reason = "relay_window_closed"
+                if current.termination_reason is not None:
+                    return False
+                current.process = process
+                current.process_job = process_job
+                current.updated_at = iso_timestamp()
                 self._mark_gui_changed_locked()
-                return
-            creation_flags = 0
-            if os.name == "nt":
-                creation_flags = (
-                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                    | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                )
-            try:
-                process = subprocess.Popen(
-                    command,
-                    cwd=frozen["working_directory"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    shell=False,
-                    creationflags=creation_flags,
-                )
-            except (OSError, ValueError) as exc:
-                process_job.close()
-                record.state = "failed"
-                record.updated_at = iso_timestamp()
-                record.terminal_monotonic = time.monotonic()
-                record.result = {
-                    "decision": "approved",
-                    "message": f"Process creation failed: {type(exc).__name__}: {exc}",
-                }
-                self._mark_gui_changed_locked()
-                return
-            try:
-                process_job.assign(process)
-            except RelayError as exc:
-                try:
-                    process.kill()
-                    process.wait(timeout=2)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-                process_job.close()
-                record.state = "failed"
-                record.updated_at = iso_timestamp()
-                record.terminal_monotonic = time.monotonic()
-                record.result = {
-                    "decision": "approved",
-                    "message": f"Process containment failed: {exc.message}",
-                    "error": exc.as_dict()["error"],
-                }
-                self._mark_gui_changed_locked()
-                return
-            if self._shutting_down:
-                try:
-                    process_job.terminate(1)
-                except OSError:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
-                process_job.close()
-                record.state = "cancelled"
-                record.updated_at = iso_timestamp()
-                record.terminal_monotonic = time.monotonic()
-                record.result = {
-                    "decision": "approved",
-                    "message": "The window closed as the approved process was created.",
-                }
-                self._mark_gui_changed_locked()
-                return
-            record.process = process
-            record.process_job = process_job
+                return True
+
+        command = [frozen["executable"], *frozen["arguments"]]
+        try:
+            process = start_contained_process(
+                command, working_directory=frozen["working_directory"], job=process_job,
+                env=frozen.get("execution_environment"), before_resume=before_resume,
+            )
+        except (OSError, ValueError, RelayError) as exc:
+            process_job.close()
+            self._finish_execution(
+                request_id, state="failed",
+                message=f"Contained process startup failed: {type(exc).__name__}: {exc}",
+                result={"reason_code": exc.code if isinstance(exc, RelayError) else "process_creation_failed"},
+            )
+            return
+        with self._condition:
+            if record.termination_reason is None:
+                record.execution_phase = "running"
             record.updated_at = iso_timestamp()
             self._mark_gui_changed_locked()
-
-        stdout_bytes = bytearray()
-        stderr_bytes = bytearray()
-        stdout_truncated = [False]
-        stderr_truncated = [False]
         assert process.stdout is not None
         assert process.stderr is not None
         stdout_thread = threading.Thread(
             target=self._drain_stream,
-            args=(process.stdout, stdout_bytes, stdout_truncated),
+            args=(request_id, process.stdout, output_buffers["stdout"]),
             daemon=True,
         )
         stderr_thread = threading.Thread(
             target=self._drain_stream,
-            args=(process.stderr, stderr_bytes, stderr_truncated),
+            args=(request_id, process.stderr, output_buffers["stderr"]),
             daemon=True,
         )
         stdout_thread.start()
@@ -2613,22 +2748,23 @@ class RequestStore:
                 except subprocess.TimeoutExpired:
                     return_code = None
 
+        # Once the main process exits, close its job before draining pipes so
+        # descendants cannot retain output handles or outlive this request.
+        process_job.close()
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
-        if stdout_thread.is_alive():
-            stdout_truncated[0] = True
-        if stderr_thread.is_alive():
-            stderr_truncated[0] = True
-        stdout_text, stdout_encoding = self._decode_output(bytes(stdout_bytes))
-        stderr_text, stderr_encoding = self._decode_output(bytes(stderr_bytes))
+        encoding = frozen.get("output_encoding", "auto")
+        stdout_text, stdout_encoding, stdout_truncated = output_buffers["stdout"].render(encoding)
+        stderr_text, stderr_encoding, stderr_truncated = output_buffers["stderr"].render(encoding)
         result = {
             "exit_code": return_code,
             "stdout": stdout_text,
             "stderr": stderr_text,
-            "stdout_truncated": stdout_truncated[0],
-            "stderr_truncated": stderr_truncated[0],
+            "stdout_truncated": stdout_truncated or stdout_thread.is_alive(),
+            "stderr_truncated": stderr_truncated or stderr_thread.is_alive(),
             "stdout_encoding": stdout_encoding,
             "stderr_encoding": stderr_encoding,
+            "output_retention": "bounded_head_and_tail",
             "shell": False,
         }
         if timed_out:
@@ -2709,8 +2845,22 @@ class RequestStore:
                         "reason_code": "relay_window_closed",
                         "message": "The relay window closed before a decision.",
                     }
-                elif record.state == "running" and record.process is not None:
-                    processes.append((record.process, record.process_job))
+                elif record.state == "running":
+                    if record.termination_reason is None:
+                        record.termination_reason = "relay_window_closed"
+                    if record.process is not None:
+                        record.execution_phase = "terminating"
+                        processes.append((record.process, record.process_job))
+                    elif record.execution_phase == "queued":
+                        record.state = "cancelled"
+                        record.execution_phase = "finished"
+                        record.updated_at = iso_timestamp()
+                        record.terminal_monotonic = time.monotonic()
+                        record.result = {
+                            "decision": "approved",
+                            "reason_code": "relay_window_closed",
+                            "message": "The relay window closed before queued execution started.",
+                        }
             self._mark_gui_changed_locked()
         for process, process_job in processes:
             try:
@@ -2764,12 +2914,15 @@ class RelayRequestHandler(socketserver.StreamRequestHandler):
                         "broker_build_id": BROKER_BUILD_ID,
                     },
                 )
-            server.note_connector(
-                client_version=str(request.get("client_version")),
-                client_build_id=str(request.get("client_build_id")),
-                client_instance_id=request.get("client_instance_id"),
-                codex_thread_id=request.get("codex_thread_id"),
-            )
+            # A launcher's read-only readiness probe is not evidence that an
+            # MCP connector has connected to this window.
+            if not (request.get("operation") == "health" and request.get("client_role") == "launcher"):
+                server.note_connector(
+                    client_version=str(request.get("client_version")),
+                    client_build_id=str(request.get("client_build_id")),
+                    client_instance_id=request.get("client_instance_id"),
+                    codex_thread_id=request.get("codex_thread_id"),
+                )
 
             operation = request.get("operation")
             if operation == "health":
@@ -2790,6 +2943,8 @@ class RelayRequestHandler(socketserver.StreamRequestHandler):
                     request.get("payload"),
                     request.get("client_instance_id"),
                     request.get("codex_thread_id"),
+                    recovery_token=request.get("recovery_token"),
+                    payload_hash=request.get("payload_hash"),
                 )
                 response = {
                     "ok": True,
@@ -2797,6 +2952,15 @@ class RelayRequestHandler(socketserver.StreamRequestHandler):
                     "idempotent_replay": replay,
                     "claim_token": claim_token,
                 }
+            elif operation == "recover":
+                response = server.store.recover(request.get("recovery_token"), request.get("payload_hash"))
+            elif operation == "preflight":
+                response = preflight_command(request.get("payload"))
+            elif operation == "read_output":
+                response = {"ok": True, "output": server.store.read_output(
+                    request.get("request_id"), request.get("claim_token"),
+                    stream=request.get("stream", "stdout"), offset=request.get("offset", 0), limit=request.get("limit", 16384),
+                )}
             elif operation == "status":
                 response = {
                     "ok": True,
@@ -2806,18 +2970,41 @@ class RelayRequestHandler(socketserver.StreamRequestHandler):
                     ),
                 }
             elif operation == "wait":
-                response = {
-                    "ok": True,
-                    "request": server.store.wait(
-                        request.get("request_id"),
-                        request.get("claim_token"),
-                        request.get("wait_seconds", 0),
-                    ),
-                }
+                wait_seconds = request.get("wait_seconds", 0)
+                blocking = (
+                    not isinstance(wait_seconds, bool)
+                    and isinstance(wait_seconds, (int, float))
+                    and wait_seconds > 0
+                )
+                if blocking and not server._wait_slots.acquire(blocking=False):
+                    raise RelayError(
+                        "wait_capacity",
+                        "Blocking wait capacity is full; use wait_seconds=0 or retry this same request later.",
+                    )
+                try:
+                    response = {
+                        "ok": True,
+                        "request": server.store.wait(
+                            request.get("request_id"),
+                            request.get("claim_token"),
+                            wait_seconds,
+                        ),
+                    }
+                finally:
+                    if blocking:
+                        server._wait_slots.release()
             elif operation == "cancel":
                 response = {
                     "ok": True,
                     "request": server.store.cancel(
+                        request.get("request_id"),
+                        request.get("claim_token"),
+                    ),
+                }
+            elif operation == "terminate":
+                response = {
+                    "ok": True,
+                    "request": server.store.terminate(
                         request.get("request_id"),
                         request.get("claim_token"),
                     ),
@@ -2833,7 +3020,7 @@ class RelayRequestHandler(socketserver.StreamRequestHandler):
                 "The relay broker encountered an internal error.",
             ).as_dict()
 
-        encoded = (json_ascii(response) + "\n").encode("ascii")
+        encoded = (json_ascii(fit_wire_response(response)) + "\n").encode("ascii")
         try:
             self.wfile.write(encoded)
             self.wfile.flush()
@@ -2952,38 +3139,41 @@ def collect_install_diagnostics(
     resolved_codex_home = codex_home
     resolved_codex_home = resolved_codex_home.expanduser().resolve()
     config_path = resolved_codex_home / "config.toml"
-    configured: bool | None = None
-    config_error: str | None = None
-    if config_path.is_file():
-        try:
-            with config_path.open("rb") as handle:
-                config = tomllib.load(handle)
-            plugins = config.get("plugins", {})
-            plugin_entry = (
-                plugins.get("golden-finger@personal", {})
-                if isinstance(plugins, dict)
-                else {}
-            )
-            if isinstance(plugin_entry, dict):
-                value = plugin_entry.get("enabled")
-                configured = value if isinstance(value, bool) else None
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            config_error = f"{type(exc).__name__}: {exc}"
+    configured, config_entries, config_error = read_plugin_configuration(config_path)
 
     cache_root = resolved_codex_home / "plugins" / "cache"
     cached: list[dict[str, Any]] = []
-    if cache_root.is_dir():
-        for plugin_root in sorted(cache_root.glob("*/golden-finger")):
-            marketplace = plugin_root.parent.name
-            for version_path in sorted(plugin_root.iterdir()):
+    cache_errors: list[str] = []
+    try:
+        plugin_roots = sorted(cache_root.glob("*/golden-finger")) if cache_root.is_dir() else []
+    except OSError:
+        plugin_roots = []
+        cache_errors.append("插件缓存目录无法读取；缓存检测结果可能不完整。")
+    for plugin_root in plugin_roots:
+        marketplace = plugin_root.parent.name
+        try:
+            version_paths = sorted(plugin_root.iterdir())
+        except OSError:
+            cache_errors.append(f"{marketplace} 的金手指缓存目录无法读取。")
+            continue
+        for version_path in version_paths:
+            try:
                 if not version_path.is_dir():
                     continue
                 build_path = version_path / "BUILD-ID.txt"
                 build_id: str | None = None
                 if build_path.is_file():
                     try:
-                        build_id = build_path.read_text(encoding="ascii").strip()
-                    except OSError:
+                        with build_path.open("rb") as handle:
+                            raw_id = handle.read(129)
+                        build_id = raw_id.decode("ascii").strip()
+                        if len(raw_id) > 128 or not (
+                            build_id.startswith(("src-", "rel-"))
+                            and len(build_id) == 28
+                            and all(char in "0123456789abcdef" for char in build_id[4:])
+                        ):
+                            build_id = "(invalid)"
+                    except (OSError, UnicodeError):
                         build_id = "(unreadable)"
                 cached.append(
                     {
@@ -2993,6 +3183,8 @@ def collect_install_diagnostics(
                         "path": str(version_path),
                     }
                 )
+            except OSError:
+                cache_errors.append(f"{marketplace} 的一个缓存版本无法检查。")
 
     shortcut_roots = [Path.home() / "Desktop"]
     roaming = os.environ.get("APPDATA")
@@ -3021,6 +3213,16 @@ def collect_install_diagnostics(
     exact_build_cached = any(
         item.get("build_id") == BROKER_BUILD_ID for item in cached
     )
+    job_available: bool | None = None
+    job_error: str | None = None
+    if os.name == "nt":
+        try:
+            probe_job = WindowsJob.create()
+            job_available = probe_job.active
+            probe_job.close()
+        except RelayError as exc:
+            job_available = False
+            job_error = exc.code
     return {
         "product": "Codex金手指",
         "protocol": PROTOCOL_VERSION,
@@ -3029,7 +3231,8 @@ def collect_install_diagnostics(
         "runtime_mode": runtime_mode,
         "runtime_executable": str(executable_path),
         "broker_elevated": is_elevated(),
-        "job_object_available": os.name == "nt",
+        "job_object_available": job_available,
+        "job_object_error": job_error,
         "endpoint_path": str((endpoint_directory() / "endpoint.json").resolve()),
         "endpoint_present": (endpoint_directory() / "endpoint.json").is_file(),
         "companion_mcp_executable": (
@@ -3041,8 +3244,10 @@ def collect_install_diagnostics(
         "codex_home": str(resolved_codex_home),
         "plugin_config_path": str(config_path),
         "plugin_enabled": configured,
+        "plugin_config_entries": config_entries,
         "plugin_config_error": config_error,
         "cached_installs": cached,
+        "cache_scan_errors": cache_errors,
         "exact_version_cached": exact_version_cached,
         "exact_build_cached": exact_build_cached,
         "shortcuts": shortcuts,
@@ -3060,60 +3265,14 @@ def collect_install_diagnostics(
 
 
 def format_install_diagnostics(diagnostics: dict[str, Any]) -> str:
-    """Render the diagnostics snapshot as copyable, human-readable text."""
-
-    connector = diagnostics.get("last_connector")
-    connector_lines = ["最近连接器: 尚未观察到"]
-    if isinstance(connector, dict):
-        connector_lines = [
-            "最近连接器:",
-            f"  版本/构建: {connector.get('connector_version')} / {connector.get('connector_build_id')}",
-            f"  指纹: {connector.get('connector_fingerprint') or '(未提供)'}",
-            f"  已观察任务线索: {connector.get('observed_thread_count', 0)}",
-            f"  最后连接: {connector.get('seen_at')}",
-        ]
-    cached = diagnostics.get("cached_installs", [])
-    cache_lines = ["缓存安装: 无"]
-    if isinstance(cached, list) and cached:
-        cache_lines = ["缓存安装:"] + [
-            (
-                f"  {item.get('marketplace')} / {item.get('version')}"
-                f" / build={item.get('build_id') or '(未标记)'}"
-            )
-            for item in cached
-            if isinstance(item, dict)
-        ]
-    shortcut_values = diagnostics.get("shortcuts", [])
-    shortcut_lines = ["快捷方式: 未发现"]
-    if isinstance(shortcut_values, list) and shortcut_values:
-        shortcut_lines = ["快捷方式:"] + [f"  {value}" for value in shortcut_values]
-    lines = [
-        "Codex金手指 · 安装诊断（已脱敏）",
-        "",
-        f"Broker: {diagnostics.get('broker_version')} / {diagnostics.get('broker_build_id')}",
-        f"协议: {diagnostics.get('protocol')}",
-        f"运行模式: {diagnostics.get('runtime_mode')}",
-        f"运行文件: {diagnostics.get('runtime_executable')}",
-        f"管理员权限: {'是' if diagnostics.get('broker_elevated') else '否'}",
-        f"Job Object: {'可用' if diagnostics.get('job_object_available') else '不可用'}",
-        f"Endpoint: {diagnostics.get('endpoint_path')}",
-        f"Codex 插件已启用: {diagnostics.get('plugin_enabled')}",
-        f"当前版本缓存存在: {diagnostics.get('exact_version_cached')}",
-        f"当前精确构建缓存存在: {diagnostics.get('exact_build_cached')}",
-        f"连接器与窗口精确匹配: {diagnostics.get('component_match')}",
-        *connector_lines,
-        *cache_lines,
-        *shortcut_lines,
-    ]
-    if diagnostics.get("plugin_config_error"):
-        lines.append(f"配置读取错误: {diagnostics['plugin_config_error']}")
-    lines.extend(["", str(diagnostics.get("security_note", ""))])
-    return "\n".join(lines)
+    """Render safe installation evidence and next steps."""
+    return format_diagnostics(diagnostics)
 
 
 class RelayTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = False
     daemon_threads = True
+    request_queue_size = MAX_CLIENT_CONNECTIONS
 
     def __init__(
         self,
@@ -3128,7 +3287,28 @@ class RelayTCPServer(socketserver.ThreadingTCPServer):
         self._connector_lock = threading.Lock()
         self._last_connector: dict[str, Any] | None = None
         self._connector_thread_ids: OrderedDict[str, None] = OrderedDict()
+        self._connection_slots = threading.BoundedSemaphore(MAX_CLIENT_CONNECTIONS)
+        # Long polls cannot occupy every connection slot: cancellation,
+        # termination, health and immediate reads must remain reachable.
+        self._wait_slots = threading.BoundedSemaphore(MAX_BLOCKING_WAITS)
         super().__init__(address, handler)
+
+    def process_request(self, request: socket.socket, client_address: Any) -> None:
+        if not self._connection_slots.acquire(blocking=False):
+            # Do not spawn a thread (or block on a slow client) once full.
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_slots.release()
 
     def note_connector(
         self,
@@ -3241,6 +3421,9 @@ class RelayWindow:
         except tk.TclError:
             pass
         self._ui_settings = dict(settings)
+        self._window_preferences_path = endpoint_directory() / "window-preferences.json"
+        self._window_preferences = load_preferences(self._window_preferences_path)
+        self._tray = TrayBridge()
         self._ui_settings["auto_approve_wait_seconds"] = self._auto_approve_wait_seconds
         self.auto_approve_wait_value = tk.StringVar(
             master=root, value=str(self._auto_approve_wait_seconds)
@@ -3397,7 +3580,7 @@ class RelayWindow:
         self.connection_label.grid(row=0, column=1, sticky="w", padx=(12, 0))
         self.header_subtitle = ttk.Label(
             header,
-            text="人机授权中继 · 停止仅结束等待，不代表同意或拒绝",
+            text=("管理员权限 · 命令继承管理员权限" if self.store.elevated else "普通用户权限 · 命令继承窗口权限"),
             style="Subtitle.HAR.TLabel",
         )
         self.header_subtitle.pack(anchor=tk.W, pady=(4, 0))
@@ -3408,8 +3591,7 @@ class RelayWindow:
         self.wait_policy_label = ttk.Label(
             preferences,
             text=(
-                f"等待 {DEFAULT_POLL_WAIT_SECONDS}秒 × "
-                f"{DEFAULT_PENDING_POLL_CYCLES}次"
+                f"有效期上限 {DEFAULT_POLL_WAIT_SECONDS * DEFAULT_PENDING_POLL_CYCLES} 秒"
             ),
             style="Meta.HAR.TLabel",
         )
@@ -3431,8 +3613,8 @@ class RelayWindow:
         self.sound_toggle.grid(row=0, column=2, sticky="e")
         self.computer_use_guidance_button = ttk.Button(
             preferences,
-            text="编辑 Computer Use 指南",
-            command=self.open_computer_use_guidance,
+            text="更多",
+            command=self.show_tools_menu,
             style="Diag.HAR.TButton",
             width=0,
             takefocus=True,
@@ -3442,7 +3624,7 @@ class RelayWindow:
         )
         self.diagnostics_button = ttk.Button(
             preferences,
-            text="诊断",
+            text="接入检查",
             command=self.show_diagnostics,
             style="Diag.HAR.TButton",
             width=0,
@@ -4601,6 +4783,7 @@ class RelayWindow:
                 pass
 
     def _set_pending_attention(self, active: bool) -> None:
+        active = active and self._window_preferences.get("topmost_pending", True)
         if active == self._attention_active:
             return
         self._attention_active = active
@@ -4616,6 +4799,10 @@ class RelayWindow:
             self._schedule_hit_shield_sync()
 
     def _notify_new_request(self) -> None:
+        if not self._window_preferences.get("raise_on_request", True):
+            self._set_pending_attention(True)
+            self._play_notification_sound()
+            return
         try:
             if self.root.state() in {"iconic", "withdrawn"}:
                 self.root.deiconify()
@@ -4655,6 +4842,7 @@ class RelayWindow:
             "completed": "已完成",
             "failed": "失败",
             "timed_out": "超时",
+            "terminated": "已终止",
         }
         return labels.get(state, state)
 
@@ -4834,6 +5022,7 @@ class RelayWindow:
         self.guard_label.configure(text="仅授权当前冻结请求")
 
     def _render_empty_state(self) -> None:
+        self.stop_button.set_text("停止")
         self.approve_button.set_text("同意\n本次")
         has_hidden_items = bool(self._request_rows or self._codex_tasks)
         render_signature = (
@@ -4864,6 +5053,7 @@ class RelayWindow:
         self._content_render_signature = render_signature
 
     def _render_codex_task(self, task_id: str) -> None:
+        self.stop_button.set_text("停止")
         self.approve_button.set_text("同意\n本次")
         task = self._codex_tasks.get(task_id)
         if task is None:
@@ -5063,6 +5253,13 @@ class RelayWindow:
     def refresh(self) -> None:
         if self.closing:
             return
+        while not self._tray.events.empty():
+            event = self._tray.events.get()
+            self.root.deiconify()
+            if event == "exit":
+                self.on_close()
+                if self.closing:
+                    return
         self._refresh_theme()
         self._update_connection_status()
         self.task_monitor.register_thread_ids(self.server.connector_thread_ids())
@@ -5100,12 +5297,14 @@ class RelayWindow:
             ),
             None,
         )
-        if newest_request is not None:
+        if newest_request is not None and (
+            not self.current_request_id
+            or (self._window_preferences.get("select_new_request", True) and not self._detail_expanded)
+        ):
             request_id = str(newest_request["request_id"])
             if self._task_filter != "active":
                 self._set_task_filter("active")
             self._select_item(self._request_item_id(request_id))
-            self._notify_new_request()
         elif (
             self.current_request_id
             and self.current_request_id in self._request_rows
@@ -5126,6 +5325,8 @@ class RelayWindow:
                 self.current_item_id = None
                 self._render_empty_state()
 
+        if newest_request is not None:
+            self._notify_new_request()
         self._set_pending_attention(pending_count > 0)
         self._update_inventory_and_restart(
             inventory,
@@ -5191,6 +5392,8 @@ class RelayWindow:
             request_id,
             detail["request_hash"],
             detail["state"],
+            detail.get("execution_phase"),
+            detail.get("output_revision"),
             detail["updated_at"],
             poll_policy["pending_polls_used"],
             remaining_seconds,
@@ -5237,11 +5440,10 @@ class RelayWindow:
             f"创建时间: {detail['created_at']}",
             f"到期时间: {detail['expires_at']}",
             f"授权有效期: {frozen['expires_in_seconds']} 秒",
-            f"单次轮询等待: {poll_policy['wait_seconds']} 秒",
+            f"单次轮询上限: {poll_policy['wait_seconds']} 秒（支持短等待）",
             (
-                "等待确认轮询: "
-                f"已用 {poll_policy['pending_polls_used']} / "
-                f"上限 {poll_policy['max_pending_polls']} 次"
+                "等待调用统计: "
+                f"{poll_policy['pending_polls_used']} 次（到期以有效期限为准）"
             ),
             (
                 "等待确认预算: "
@@ -5313,19 +5515,30 @@ class RelayWindow:
                     str(frozen["working_directory"]),
                     "",
                     f"执行超时: {frozen['timeout_seconds']} 秒",
-                    "环境: 继承此窗口进程；stdin 关闭；stdout/stderr 各最多保留 256 KiB。",
+                    "环境: 未覆盖项继承此窗口进程；stdin 关闭；日志有界保留头尾。",
+                    "环境覆盖变量: " + (", ".join(sorted(frozen.get("execution_environment", {}))) or "无"),
+                    "环境覆盖完整值（仅本机命令详情）: " + json.dumps(frozen.get("execution_environment", {}), ensure_ascii=False),
+                    "输出编码: " + frozen.get("output_encoding", "auto"),
+                    "命令行 UTF-16 单元: " + str(frozen.get("command_line_utf16_units", "未记录")),
                 ]
             )
         if detail.get("receipt"):
             lines.extend(["", "一次性决策回执:", json.dumps(detail["receipt"], ensure_ascii=False, indent=2)])
         if detail.get("result"):
             lines.extend(["", "结果:", json.dumps(detail["result"], ensure_ascii=False, indent=2)])
+        if detail.get("output_summary"):
+            lines.extend(["", "已采集输出（有界头尾，可用 read_command_output 分页读取）:", json.dumps(detail["output_summary"], ensure_ascii=False)])
+            for stream in ("stdout", "stderr"):
+                if detail.get(stream + "_tail"):
+                    lines.extend([stream + " 最近输出:", str(detail[stream + "_tail"])])
         self._set_detail("\n".join(lines), reset_scroll=reset_scroll)
         self._detail_request_id = request_id
 
         pending = detail["state"] == "pending"
+        running = detail["state"] == "running"
         self.approve_button.set_state(tk.NORMAL if pending else tk.DISABLED)
-        self.stop_button.set_state(tk.NORMAL if pending else tk.DISABLED)
+        self.stop_button.set_text("终止" if running else "停止")
+        self.stop_button.set_state(tk.NORMAL if pending or running else tk.DISABLED)
         self.reject_button.set_state(tk.NORMAL if pending else tk.DISABLED)
         state_text = self._state_label(str(detail["state"]))
         if pending:
@@ -5333,12 +5546,18 @@ class RelayWindow:
                 minutes, seconds = divmod(remaining_seconds, 60)
                 state_text = (
                     f"待确认 · 剩余 {minutes:02d}:{seconds:02d} · "
-                    f"轮询 {poll_policy['pending_polls_used']}/{poll_policy['max_pending_polls']}"
+                    f"已轮询 {poll_policy['pending_polls_used']} 次"
                 )
             else:
                 state_text = "待确认"
         elif detail["state"] == "running":
-            state_text = "命令执行中 · 请勿关闭窗口"
+            state_text = {
+                "queued": "已获批 · 排队等待执行（同目录串行）",
+                "starting": "正在启动命令",
+                "terminating": "正在终止执行 · 已发生的更改不会撤销",
+            }.get(detail.get("execution_phase"), "命令执行中 · 可单独终止")
+        elif detail["state"] == "terminated":
+            state_text = "已终止执行 · 已发生的更改未撤销"
         elif (
             detail["state"] == "cancelled"
             and isinstance(detail.get("result"), dict)
@@ -5375,7 +5594,17 @@ class RelayWindow:
         if not request_id:
             return
         try:
-            self.store.cancel_from_gui(request_id)
+            detail = self.store.detail_for_gui(request_id)
+            if detail["state"] == "running":
+                if not self._show_modal_message(
+                    messagebox.askyesno, "终止这条命令？",
+                    "将终止此请求的执行或移出执行队列。已产生的文件、网络或系统更改不会撤销。",
+                    parent=self.root,
+                ):
+                    return
+                self.store.terminate_from_gui(request_id)
+            else:
+                self.store.cancel_from_gui(request_id)
         except RelayError as exc:
             self._show_modal_message(messagebox.showerror, "无法停止", exc.message, parent=self.root)
         self._render_detail(request_id)
@@ -5487,6 +5716,94 @@ class RelayWindow:
                 parent=self.root,
             )
 
+    def show_tools_menu(self) -> None:
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="通知与选择偏好", command=self.show_notification_preferences)
+        menu.add_command(label="收起到系统托盘", command=self.hide_to_tray)
+        menu.add_command(label="导出脱敏操作摘要", command=self.export_audit_summary)
+        menu.add_separator()
+        menu.add_command(label="编辑 Computer Use 指南", command=self.open_computer_use_guidance)
+        menu.add_command(label="安全重启 Codex", command=self.request_safe_restart)
+        try:
+            menu.tk_popup(self.computer_use_guidance_button.winfo_rootx(),
+                          self.computer_use_guidance_button.winfo_rooty() +
+                          self.computer_use_guidance_button.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def show_notification_preferences(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("通知与选择偏好")
+        window.transient(self.root)
+        panel = ttk.Frame(window, padding=20, style="HAR.TFrame")
+        panel.pack(fill=tk.BOTH, expand=True)
+        variables = {}
+        for key, label in (
+            ("raise_on_request", "新请求到来时唤起窗口"),
+            ("topmost_pending", "有待确认请求时保持置顶"),
+            ("select_new_request", "自动选中新请求（查看详情时保留当前项）"),
+        ):
+            variable = tk.BooleanVar(window, value=self._window_preferences[key])
+            variables[key] = variable
+            ttk.Checkbutton(panel, text=label, variable=variable,
+                            style="HAR.TCheckbutton").pack(anchor=tk.W, pady=6)
+        ttk.Label(panel, text="这些设置只改变提醒方式，不改变审批或执行规则。",
+                  style="Meta.HAR.TLabel").pack(anchor=tk.W, pady=8)
+        def save() -> None:
+            values = {key: variable.get() for key, variable in variables.items()}
+            try:
+                save_preferences(self._window_preferences_path, values)
+            except OSError:
+                messagebox.showerror("保存失败", "窗口偏好无法保存，请检查目录写入权限。", parent=window)
+                return
+            self._window_preferences = values
+            pending, _ = self.store.active_counts()
+            self._set_pending_attention(pending > 0)
+            window.destroy()
+        ttk.Button(panel, text="保存", command=save, style="Diag.HAR.TButton").pack(anchor=tk.E, pady=8)
+        window.grab_set()
+
+    def hide_to_tray(self) -> None:
+        if not self._tray.start():
+            self._show_modal_message(messagebox.showerror, "无法收起到托盘",
+                                     "托盘组件不可用，窗口将保持打开。请使用完整发行包。", parent=self.root)
+            return
+        # Never hide before the tray icon has actually been installed.
+        attempts = 0
+        def hide_when_ready() -> None:
+            nonlocal attempts
+            if self.closing:
+                return
+            if self._tray.ready.is_set() and not self._tray.failed.is_set():
+                self._hide_hit_shield()
+                self.root.withdraw()
+            elif self._tray.failed.is_set() or attempts >= 20:
+                self._show_modal_message(messagebox.showerror, "托盘未就绪",
+                                         "窗口保持打开，未隐藏到不可访问的位置。", parent=self.root)
+            else:
+                attempts += 1
+                self.root.after(100, hide_when_ready)
+        hide_when_ready()
+
+    def export_audit_summary(self) -> None:
+        destination = self._show_modal_message(
+            filedialog.asksaveasfilename, parent=self.root, title="导出脱敏操作摘要",
+            defaultextension=".json", initialfile="golden-finger-summary.json",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not destination:
+            return
+        payload = {
+            "product": "GoldenFinger", "version": BROKER_VERSION,
+            "exported_at": iso_timestamp(),
+            "note": "仅包含当前窗口保留的有限历史；不包含命令、输出、令牌或来源正文。",
+            "requests": self.store.audit_snapshot(),
+        }
+        try:
+            Path(destination).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            self._show_modal_message(messagebox.showerror, "导出失败", "无法写入所选文件。", parent=self.root)
+
     def show_diagnostics(self) -> None:
         existing = self._diagnostic_window
         if existing is not None:
@@ -5503,7 +5820,7 @@ class RelayWindow:
         )
         window = tk.Toplevel(self.root)
         self._diagnostic_window = window
-        window.title("Codex金手指 · 安装诊断")
+        window.title("Codex金手指 · 接入检查")
         window.geometry("760x560")
         window.minsize(620, 420)
         window.transient(self.root)
@@ -5545,6 +5862,17 @@ class RelayWindow:
         actions = ttk.Frame(window, padding=(14, 6, 14, 14), style="HAR.TFrame")
         actions.grid(row=1, column=0, sticky="ew")
         actions.columnconfigure(0, weight=1)
+
+        def refresh_snapshot() -> None:
+            nonlocal rendered
+            rendered = format_install_diagnostics(collect_install_diagnostics(self.server))
+            text_widget.configure(state=tk.NORMAL)
+            text_widget.delete("1.0", tk.END)
+            text_widget.insert("1.0", rendered)
+            text_widget.configure(state=tk.DISABLED)
+
+        ttk.Button(actions, text="刷新检查", command=refresh_snapshot,
+                   style="Diag.HAR.TButton").grid(row=0, column=0, sticky="w")
 
         def copy_snapshot() -> None:
             try:
@@ -5605,6 +5933,7 @@ class RelayWindow:
         ):
             return
         self.closing = True
+        self._tray.stop()
         self._restart_cancel.set()
         for job in (
             self._hit_shield_sync_job,

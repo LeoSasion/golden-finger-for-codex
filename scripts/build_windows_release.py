@@ -7,7 +7,6 @@ It never installs the plugin, edits a marketplace, or creates shortcuts.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import re
@@ -15,21 +14,20 @@ import shutil
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
+from release_metadata import (
+    MANIFEST_SCHEMA_VERSION, VERSION, build_provenance, sha256_file, read_protocol_version,
+    source_build_id as fingerprint_source,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.2.0"
 STAGE = ROOT / "build" / "golden-finger-release-stage"
 PYINSTALLER_WORK = ROOT / "build" / "pyinstaller"
 PYINSTALLER_DIST = PYINSTALLER_WORK / "dist"
 DIST_ROOT = ROOT / "dist"
 PACKAGE_ROOT = DIST_ROOT / f"golden-finger-{VERSION}"
 BIN_DIR = PACKAGE_ROOT / "bin"
-RUNTIME_FILES = (
-    ROOT / "scripts" / "relay_protocol.py",
-    ROOT / "scripts" / "codex_lifecycle.py",
-    ROOT / "scripts" / "relay_mcp_server.py",
-    ROOT / "scripts" / "relay_broker.py",
-)
 
 
 def ignore_python_cache(_directory: str, names: list[str]) -> set[str]:
@@ -41,22 +39,9 @@ def ignore_python_cache(_directory: str, names: list[str]) -> set[str]:
     }
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1_048_576), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def source_build_id() -> str:
-    digest = hashlib.sha256()
-    for path in RUNTIME_FILES:
-        digest.update(path.name.encode("ascii"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return "rel-" + digest.hexdigest()[:24]
+    # Shared with source runtime; includes codex_lifecycle.py and future modules.
+    return fingerprint_source(ROOT / "scripts", prefix="rel-")
 
 
 def checked_directory(path: Path, parent: Path) -> Path:
@@ -101,6 +86,7 @@ def write_shared_onedir_spec(stage: Path) -> Path:
     scripts = stage / "scripts"
     broker_script = (scripts / "relay_broker.py").as_posix()
     mcp_script = (scripts / "relay_mcp_server.py").as_posix()
+    setup_script = (scripts / "install_release.py").as_posix()
     search_path = scripts.as_posix()
     spec = f'''# -*- mode: python ; coding: utf-8 -*-
 
@@ -109,7 +95,7 @@ broker_analysis = Analysis(
     pathex=[{search_path!r}],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=["pystray._win32"],
     hookspath=[],
     hooksconfig={{}},
     runtime_hooks=[],
@@ -135,9 +121,15 @@ mcp_analysis = Analysis(
     noarchive=False,
     optimize=0,
 )
+setup_analysis = Analysis(
+    [{setup_script!r}], pathex=[{search_path!r}], binaries=[], datas=[],
+    hiddenimports=[], hookspath=[], hooksconfig={{}}, runtime_hooks=[],
+    excludes=[], noarchive=False, optimize=0,
+)
 
 broker_pyz = PYZ(broker_analysis.pure)
 mcp_pyz = PYZ(mcp_analysis.pure)
+setup_pyz = PYZ(setup_analysis.pure)
 
 broker_exe = EXE(
     broker_pyz,
@@ -175,14 +167,22 @@ mcp_exe = EXE(
     entitlements_file=None,
     contents_directory="golden-finger.runtime",
 )
+setup_exe = EXE(
+    setup_pyz, setup_analysis.scripts, [], exclude_binaries=True,
+    name="GoldenFingerSetup", debug=False, strip=False, upx=True,
+    console=True, contents_directory="golden-finger.runtime",
+)
 
 bundle = COLLECT(
     broker_exe,
     mcp_exe,
+    setup_exe,
     broker_analysis.binaries,
     broker_analysis.datas,
     mcp_analysis.binaries,
     mcp_analysis.datas,
+    setup_analysis.binaries,
+    setup_analysis.datas,
     strip=False,
     upx=True,
     upx_exclude=[],
@@ -238,30 +238,18 @@ def run_pyinstaller(stage: Path) -> tuple[Path, Path]:
 
 
 def release_mcp_config() -> dict[str, object]:
-    return {
-        "mcpServers": {
-            "golden_finger": {
-                "title": "Codex金手指",
-                "description": (
-                    "Golden Finger for Codex: connect Codex to the separately launched "
-                    "human-authorization relay window for the Yes工程师 workflow."
-                ),
-                "command": "./bin/golden-finger-mcp.exe",
-                "args": [],
-                "cwd": ".",
-                "env_vars": ["LOCALAPPDATA", "PATH", "USERPROFILE"],
-                "startup_timeout_sec": 10,
-                "tool_timeout_sec": 65,
-                "default_tools_approval_mode": "auto",
-            }
-        }
-    }
+    # Keep transport budgets, environment and approvals in one configuration.
+    # Source and binary installations differ only in the executable entry point.
+    config = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
+    server = config["mcpServers"]["golden_finger"]
+    server.update(command="./bin/golden-finger-mcp.exe", args=[], cwd=".")
+    return config
 
 
 def copy_plugin_payload(stage: Path, build_id: str) -> None:
     reset_directory(PACKAGE_ROOT, DIST_ROOT)
     BIN_DIR.mkdir(parents=True, exist_ok=True)
-    for directory in (".codex-plugin", "skills"):
+    for directory in (".codex-plugin", "skills", "assets", "docs"):
         shutil.copytree(
             ROOT / directory,
             PACKAGE_ROOT / directory,
@@ -272,8 +260,12 @@ def copy_plugin_payload(stage: Path, build_id: str) -> None:
         PACKAGE_ROOT / "scripts",
         ignore=ignore_python_cache,
     )
-    for name in ("README.md", "EXTERNAL-TESTING.md"):
+    for name in ("README.md", "EXTERNAL-TESTING.md", "requirements-build.txt"):
         shutil.copy2(ROOT / name, PACKAGE_ROOT / name)
+    plugin_file = PACKAGE_ROOT / ".codex-plugin" / "plugin.json"
+    plugin = json.loads(plugin_file.read_text(encoding="utf-8"))
+    if plugin.get("version") != VERSION:
+        raise RuntimeError("Plugin metadata version differs from release_metadata.VERSION.")
     (PACKAGE_ROOT / ".mcp.json").write_text(
         json.dumps(release_mcp_config(), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -296,12 +288,15 @@ def write_manifest(build_id: str) -> Path:
                 "sha256": sha256_file(path),
             }
     manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "name": "golden-finger",
         "version": VERSION,
         "build_id": build_id,
+        "protocol": read_protocol_version(PACKAGE_ROOT / "scripts"),
         "platform": "windows",
         "architecture": "x64",
         "layout": "pyinstaller-shared-onedir",
+        "provenance": build_provenance(ROOT),
         "files": files,
     }
     destination = PACKAGE_ROOT / "build-manifest.json"
@@ -341,6 +336,8 @@ def main() -> int:
         run_pyinstaller(stage)
     write_manifest(build_id)
     archive = make_zip()
+    checksum = archive.with_suffix(archive.suffix + ".sha256")
+    checksum.write_text(sha256_file(archive) + "  " + archive.name + "\n", encoding="ascii")
     print(
         json.dumps(
             {
@@ -349,6 +346,7 @@ def main() -> int:
                 "build_id": build_id,
                 "package": str(PACKAGE_ROOT),
                 "archive": str(archive),
+                "checksum": str(checksum),
                 "executables_built": not args.prepare_only,
             },
             ensure_ascii=False,

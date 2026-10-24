@@ -6,6 +6,7 @@ import ast
 import json
 from pathlib import Path
 import sys
+from release_metadata import VERSION
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -136,7 +137,7 @@ def validate_manifest() -> None:
     version = manifest.get("version")
     require(
         isinstance(version, str)
-        and (version == "0.2.0" or version.startswith("0.2.0+codex.")),
+        and (version == VERSION or version.startswith(VERSION + "+codex.")),
         "unexpected plugin version",
     )
     require(manifest.get("skills") == "./skills/", "skills path is missing")
@@ -225,7 +226,7 @@ def validate_python_sources() -> None:
         ):
             operations.add(comparator.value)
     require(
-        operations == {"health", "submit", "status", "wait", "cancel"},
+        operations == {"health", "submit", "status", "wait", "cancel", "terminate", "recover", "preflight", "read_output"},
         f"broker transport operation set drifted: {sorted(operations)}",
     )
     require("approve" not in operations, "transport must never expose approve")
@@ -246,7 +247,7 @@ def validate_python_sources() -> None:
         "SetForegroundWindow",
         "if enabled == self._enabled:",
         "diameter=170",
-        "if requested_wait > 0",
+        '"expiry_basis": "monotonic_deadline"',
         "winsound.MessageBeep",
         "new_request_ids",
         'UI_SETTINGS_FILENAME = "ui-settings.json"',
@@ -303,12 +304,10 @@ def validate_python_sources() -> None:
         "claim_fingerprint",
         "secrets.compare_digest",
         "dict[tuple[str, str], str]",
-        "class WindowsJob",
-        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
         "verify_script_dependencies",
         "collect_install_diagnostics",
         "format_install_diagnostics",
-        'text="诊断"',
+        'text="接入检查"',
         "--self-test-output",
         "connector_fingerprint",
     ):
@@ -317,6 +316,9 @@ def validate_python_sources() -> None:
             f"appearance/attention contract is missing {appearance_marker!r}",
         )
     require('text="保存设置"' not in broker_source, "manual policy save button returned")
+    execution_source = load_utf8(PLUGIN_ROOT / "scripts" / "relay_execution.py")
+    for marker in ("class WindowsJob", "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", "CREATE_SUSPENDED", "resume_initial_thread"):
+        require(marker in execution_source, f"contained execution is missing {marker!r}")
     require(
         "permission_label" not in broker_source,
         "the redundant privilege banner returned",
@@ -377,12 +379,12 @@ def validate_python_sources() -> None:
 
     popen_calls = [
         node
-        for node in ast.walk(broker_tree)
+        for node in ast.walk(trees["relay_execution.py"])
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "Popen"
     ]
-    require(len(popen_calls) == 1, "broker must have exactly one reviewed Popen site")
+    require(len(popen_calls) == 1, "execution module must have exactly one reviewed Popen site")
     shell_keywords = [
         keyword for keyword in popen_calls[0].keywords if keyword.arg == "shell"
     ]
@@ -439,6 +441,10 @@ def validate_python_sources() -> None:
         "request_command_execution",
         "wait_for_authorization",
         "cancel_authorization",
+        "terminate_command",
+        "preflight_command",
+        "read_command_output",
+        "recover_authorization",
     ):
         require(tool_name in mcp_constants, f"MCP tool {tool_name!r} is missing")
     require("approve_authorization" not in mcp_constants, "MCP exposes an approval tool")
@@ -446,7 +452,7 @@ def validate_python_sources() -> None:
         "must_continue_current_turn",
         "do_not_wait_for_user_message",
         "wait_for_authorization",
-        "pending_polls_remaining",
+        "remaining_seconds",
         "claim_token",
         "notifications/cancelled",
     ):
@@ -493,9 +499,9 @@ def validate_python_sources() -> None:
     )
 
     protocol_source = load_utf8(PLUGIN_ROOT / "scripts" / "relay_protocol.py")
-    require("PROTOCOL_VERSION = 5" in protocol_source, "relay protocol version must be 5")
+    require("PROTOCOL_VERSION = 7" in protocol_source, "relay protocol version must be 7")
     require(
-        'PACKAGE_VERSION = "0.2.0"' in protocol_source,
+        'PACKAGE_VERSION = VERSION' in protocol_source,
         "package version drifted",
     )
     for protocol_marker in (
@@ -544,8 +550,8 @@ def validate_python_sources() -> None:
         "polling policy must remain fixed at 900 seconds x 10 polls",
     )
     require(
-        "float(MAX_POLL_WAIT_SECONDS) + 5.0" in protocol_source,
-        "relay client socket timeout must cover one full fixed wait",
+        "min(float(MAX_POLL_WAIT_SECONDS), float(wait_seconds)) + 5.0" in protocol_source,
+        "relay client socket timeout must cover the requested bounded wait",
     )
     require(
         "MIN_APPROVAL_EXPIRY_SECONDS = 10" in protocol_source,
@@ -584,10 +590,10 @@ def validate_python_sources() -> None:
         "权限横幅已移除",
         "claim_token",
         "认领指纹",
-        "协议版本 5",
+        "协议版本 7",
         "Job Object",
         "直接命名",
-        "右上角“诊断”",
+        "右上角“接入检查”",
         "精确 build ID",
         "自包含 Windows 发行包",
         "使用作用域与窗口生命周期",
@@ -606,7 +612,6 @@ def validate_python_sources() -> None:
         "PyInstaller",
         "GoldenFinger",
         "golden-finger-mcp",
-        "codex_lifecycle.py",
         "BUILD-ID.txt",
         "build-manifest.json",
         "ignore_python_cache",

@@ -6,6 +6,8 @@ may transition a pending request into an approved/running state.
 
 from __future__ import annotations
 
+import copy
+import codecs
 import hashlib
 import hmac
 import json
@@ -15,13 +17,18 @@ import secrets
 import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 from typing import Any
 
+from release_metadata import VERSION, source_build_id
 
-PROTOCOL_VERSION = 5
-PACKAGE_VERSION = "0.2.0"
+
+PROTOCOL_VERSION = 7
+PACKAGE_VERSION = VERSION
 PACKAGE_BUILD_ID = "source"
 PRODUCT_NAME = "GoldenFinger"
 ENDPOINT_FILENAME = "endpoint.json"
@@ -34,7 +41,7 @@ MAX_PENDING_REQUESTS = 16
 MAX_OUTPUT_BYTES = 262_144
 MAX_EXECUTABLE_BYTES = 1_073_741_824
 MAX_SCRIPT_BYTES = 67_108_864
-SCRIPT_EXTENSIONS = frozenset({".bat", ".cmd", ".ps1", ".py", ".pyw"})
+SCRIPT_EXTENSIONS = frozenset({".bat", ".cmd", ".ps1", ".py", ".pyw", ".js", ".mjs", ".cjs"})
 MIN_APPROVAL_EXPIRY_SECONDS = 10
 DEFAULT_APPROVAL_EXPIRY_SECONDS = 9_000
 MAX_APPROVAL_EXPIRY_SECONDS = 36_000
@@ -54,6 +61,7 @@ TERMINAL_STATES = {
     "completed",
     "failed",
     "timed_out",
+    "terminated",
 }
 
 
@@ -96,6 +104,71 @@ def json_ascii(value: Any) -> str:
     )
 
 
+def fit_wire_response(
+    response: dict[str, Any], *, max_bytes: int = MAX_WIRE_BYTES
+) -> dict[str, Any]:
+    """Budget serialized bytes, preserving execution metadata ahead of log text.
+
+    Retained process bytes can expand substantially when ASCII JSON escapes
+    Unicode or control characters. Never modify the stored request snapshot.
+    """
+
+    if max_bytes < 1_024:
+        raise ValueError("A wire response budget must allow at least 1024 bytes.")
+    if len(json_ascii(response)) + 1 <= max_bytes:
+        return response
+    bounded = copy.deepcopy(response)
+    outputs: list[tuple[dict[str, Any], str, str]] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key in ("stdout", "stderr"):
+                if isinstance(value.get(key), str):
+                    outputs.append((value, key, value[key]))
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    collect(bounded)
+    for container, key, original in outputs:
+        container[key] = ""
+        if original:
+            container[key + "_truncated"] = True
+        container["wire_output_truncated"] = True
+    if len(json_ascii(bounded)) + 1 > max_bytes:
+        # Metadata should already be bounded at submission. Still fail with a
+        # small explicit error, retaining the outcome if a future field grows.
+        request = bounded.get("request", {})
+        result = request.get("result", {}) if isinstance(request, dict) else {}
+        request_id = request.get("request_id") if isinstance(request, dict) else None
+        state = request.get("state") if isinstance(request, dict) else None
+        exit_code = result.get("exit_code") if isinstance(result, dict) else None
+        return RelayError(
+            "response_too_large",
+            "Response metadata exceeded the wire budget; output was omitted.",
+            details={
+                "request_id": request_id[:256] if isinstance(request_id, str) else None,
+                "state": state[:64] if isinstance(state, str) else None,
+                "exit_code": exit_code if type(exit_code) is int else None,
+            },
+        ).as_dict()
+    low, high = 0, max((len(original) for _, _, original in outputs), default=0)
+    while low < high:
+        middle = (low + high + 1) // 2
+        for container, key, original in outputs:
+            container[key] = original[:middle]
+        if len(json_ascii(bounded)) + 1 <= max_bytes:
+            low = middle
+        else:
+            high = middle - 1
+    for container, key, original in outputs:
+        container[key] = original[:low]
+    return bounded
+
+
 def canonical_hash(value: Any) -> str:
     encoded = json_ascii(value).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
@@ -106,22 +179,12 @@ def runtime_build_id() -> str:
 
     if getattr(sys, "frozen", False) or PACKAGE_BUILD_ID != "source":
         return PACKAGE_BUILD_ID
-    root = Path(__file__).resolve().parent
-    digest = hashlib.sha256()
-    for name in ("relay_protocol.py", "relay_mcp_server.py", "relay_broker.py"):
-        path = root / name
-        try:
-            data = path.read_bytes()
-        except OSError as exc:
-            raise RelayError(
-                "runtime_unreadable",
-                f"Golden Finger runtime component {name!r} could not be read.",
-            ) from exc
-        digest.update(name.encode("ascii"))
-        digest.update(b"\0")
-        digest.update(data)
-        digest.update(b"\0")
-    return "src-" + digest.hexdigest()[:24]
+    try:
+        return source_build_id(Path(__file__).resolve().parent)
+    except OSError as exc:
+        raise RelayError(
+            "runtime_unreadable", "A Golden Finger runtime component could not be read."
+        ) from exc
 
 
 RUNTIME_BUILD_ID = runtime_build_id()
@@ -384,22 +447,34 @@ def _reject_unknown_fields(payload: dict[str, Any], allowed: set[str]) -> None:
         )
 
 
-def _resolve_executable(value: Any) -> str:
+def _resolve_executable(value: Any, *, search_path: str | None = None, working_directory: Path | None = None) -> str:
     requested = _bounded_text(value, "executable", maximum=1_024)
     requested_path = Path(requested)
     if requested_path.is_absolute():
         resolved = requested_path
-    elif any(separator in requested for separator in ("/", "\\")):
+    elif requested_path.drive or any(separator in requested for separator in ("/", "\\")):
         raise RelayError(
             "invalid_request",
             "A relative executable containing a path separator is not allowed.",
         )
     else:
-        found = shutil.which(requested)
+        # Resolve each PATH entry from the child working directory. Passing an
+        # absolute candidate to which also avoids Windows implicitly searching
+        # the broker's own current directory before the requested PATH.
+        base = working_directory or Path.cwd()
+        found = None
+        for item in (search_path if search_path is not None else os.defpath).split(os.pathsep):
+            directory = Path(item or ".")
+            if directory.drive and not directory.is_absolute():
+                raise RelayError("invalid_environment", "Drive-relative PATH entries are not supported; use absolute paths.")
+            directory = directory if directory.is_absolute() else base / directory
+            found = shutil.which(str(directory.resolve() / requested))
+            if found:
+                break
         if not found:
             raise RelayError(
                 "executable_not_found",
-                f"Executable {requested!r} was not found in the broker PATH.",
+                f"Executable {requested!r} was not found in the requested environment PATH.",
             )
         resolved = Path(found)
 
@@ -558,12 +633,16 @@ def freeze_script_dependencies(
     executable: str,
     arguments: list[str],
     working_directory: str,
+    *,
+    response_arguments: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """Resolve and fingerprint direct script files named by the approved argv."""
 
     dependencies: list[dict[str, Any]] = []
     working_path = Path(working_directory)
     for argument_index, argument_value in _script_argument_candidates(executable, arguments):
+        if argument_value in response_arguments:
+            continue
         requested = Path(argument_value)
         candidate = requested if requested.is_absolute() else working_path / requested
         try:
@@ -648,6 +727,62 @@ def _enforce_protected_boundary(executable: str, arguments: list[str]) -> None:
         )
 
 
+def validate_recovery_token(value: Any) -> str:
+    if not isinstance(value, str) or not value.startswith("gfrc_") or not 40 <= len(value) <= 128 or not all(
+        char.isascii() and (char.isalnum() or char in "_-") for char in value
+    ):
+        raise RelayError("invalid_recovery_token", "Invalid recovery capability.")
+    return value
+
+
+def normalize_environment(value: Any) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > 64:
+        raise RelayError("invalid_environment", "Environment must contain at most 64 string overrides.")
+    result: dict[str, str] = {}
+    for key, text in value.items():
+        if not isinstance(key, str) or not key or len(key) > 128 or any(c in key for c in "=\x00\r\n"):
+            raise RelayError("invalid_environment", "Invalid environment variable name.")
+        if not isinstance(text, str) or len(text) > 8192 or "\x00" in text:
+            raise RelayError("invalid_environment", "Invalid environment variable value.")
+        normalized = key.upper() if os.name == "nt" else key
+        if normalized in result:
+            raise RelayError("invalid_environment", "Duplicate environment variable name.")
+        result[normalized] = text
+    if sum(len(k) + len(v) + 2 for k, v in result.items()) > 32768:
+        raise RelayError("invalid_environment", "Environment overrides are too large.")
+    return result
+
+
+def merge_execution_environment(overrides: dict[str, str] | None) -> dict[str, str]:
+    environment = {(key.upper() if os.name == "nt" else key): value for key, value in os.environ.items()}
+    environment.update(normalize_environment(overrides))
+    return environment
+
+
+def normalize_output_encoding(value: Any) -> str:
+    if value is None or value == "auto":
+        return "auto"
+    try:
+        name = codecs.lookup(value).name if isinstance(value, str) else ""
+    except LookupError:
+        name = ""
+    if name not in {"utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-32-le", "utf-32-be", "gbk", "gb18030", "cp437", "cp850", "cp1252", "ascii", "iso8859-1"}:
+        raise RelayError("invalid_output_encoding", "Unsupported output text encoding.")
+    return name
+
+
+def windows_command_line_units(executable: str, arguments: list[str]) -> int:
+    try:
+        units = len(subprocess.list2cmdline([executable, *arguments]).encode("utf-16-le")) // 2 + 1
+    except UnicodeEncodeError as exc:
+        raise RelayError("invalid_request", "Command line contains invalid Unicode.") from exc
+    if units > 32767:
+        raise RelayError("command_line_too_long", "The quoted Windows command line exceeds 32767 UTF-16 units. Use the tool's explicit response-file support.", details={"utf16_units": units, "maximum": 32767})
+    return units
+
+
 def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
     """Validate, resolve, and freeze a request before it is displayed."""
 
@@ -675,6 +810,9 @@ def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
             "arguments",
             "working_directory",
             "timeout_seconds",
+            "environment",
+            "output_encoding",
+            "response_files",
         }
     )
     _reject_unknown_fields(payload, common_fields | kind_fields)
@@ -777,9 +915,19 @@ def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
                 "working_directory does not resolve to a directory.",
             )
 
-        resolved_executable = _resolve_executable(payload.get("executable"))
+        environment = normalize_environment(payload.get("environment"))
+        merged_environment = merge_execution_environment(environment)
+        resolved_executable = _resolve_executable(payload.get("executable"), search_path=merged_environment.get("PATH"), working_directory=resolved_working_path)
+        command_line_units = windows_command_line_units(resolved_executable, normalized_arguments)
         executable_size, executable_sha256 = fingerprint_executable(resolved_executable)
         _enforce_protected_boundary(resolved_executable, normalized_arguments)
+        response_files = payload.get("response_files", [])
+        if not isinstance(response_files, list) or len(response_files) > 16:
+            raise RelayError("invalid_request", "response_files must be an array of at most 16 paths.")
+        response_names = [_bounded_text(value, "response_files", maximum=4096) for value in response_files]
+        for name in response_names:
+            if "@" + name not in normalized_arguments:
+                raise RelayError("invalid_request", "Each response file must appear as an exact @path argument.")
         frozen.update(
             {
                 "executable": resolved_executable,
@@ -787,10 +935,14 @@ def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
                 "executable_sha256": executable_sha256,
                 "arguments": normalized_arguments,
                 "working_directory": str(resolved_working_path),
+                "execution_environment": environment,
+                "output_encoding": normalize_output_encoding(payload.get("output_encoding")),
+                "command_line_utf16_units": command_line_units,
                 "script_dependencies": freeze_script_dependencies(
                     resolved_executable,
                     normalized_arguments,
                     str(resolved_working_path),
+                    response_arguments=frozenset("@" + name for name in response_names),
                 ),
                 "timeout_seconds": _bounded_integer(
                     payload.get("timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS),
@@ -800,10 +952,27 @@ def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
                 ),
             }
         )
+        for name in response_names:
+            path = Path(name)
+            path = path if path.is_absolute() else resolved_working_path / path
+            try:
+                path = path.resolve(strict=True)
+            except OSError as exc:
+                raise RelayError("script_not_found", "Response file is unavailable.") from exc
+            size, digest = fingerprint_script(str(path))
+            frozen["script_dependencies"].append({"argument_index": normalized_arguments.index("@" + name), "argument_value": name, "path": str(path), "size": size, "sha256": digest, "kind": "response_file"})
 
     # This hash is what the user sees. Nothing executable is added later.
     frozen["request_hash"] = canonical_hash(frozen)
     return frozen
+
+
+def preflight_command(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise RelayError("invalid_request", "Preflight arguments must be an object.")
+    _reject_unknown_fields(payload, {"executable", "arguments", "working_directory", "environment", "output_encoding", "response_files", "timeout_seconds"})
+    frozen = normalize_request("command", {**payload, "exact_action": "Read-only command preflight", "target": "Proposed command", "risk": "No execution", "recovery": "No effects", "idempotency_key": "preflight-only"})
+    return {"ok": True, "executed": False, "executable": frozen["executable"], "executable_sha256": frozen["executable_sha256"], "working_directory": frozen["working_directory"], "command_line_utf16_units": frozen["command_line_utf16_units"], "environment_keys": sorted(frozen["execution_environment"]), "output_encoding": frozen["output_encoding"], "script_dependencies": frozen["script_dependencies"], "interactive_stdin": False, "note": "Preflight is not approval; submit the exact command separately. Environment overrides are literal strings; other variables inherit the window environment."}
 
 
 class RelayClient:
@@ -812,14 +981,20 @@ class RelayClient:
     def __init__(self, metadata: dict[str, Any] | None = None) -> None:
         self.metadata = metadata or read_endpoint()
 
-    def call(self, operation: str, **parameters: Any) -> dict[str, Any]:
+    def call(
+        self,
+        operation: str,
+        *,
+        cancellation_event: threading.Event | None = None,
+        **parameters: Any,
+    ) -> dict[str, Any]:
         wait_seconds = parameters.get("wait_seconds", 0)
         if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float)):
             wait_seconds = 0
         socket_timeout = (
-            float(MAX_POLL_WAIT_SECONDS) + 5.0
+            min(float(MAX_POLL_WAIT_SECONDS), float(wait_seconds)) + 5.0
             if operation == "wait" and float(wait_seconds) > 0
-            else 3.0
+            else 30.0 if operation in {"submit", "preflight"} else 3.0
         )
         request = {
             "protocol": PROTOCOL_VERSION,
@@ -842,8 +1017,21 @@ class RelayClient:
                 connection.sendall(encoded)
                 connection.shutdown(socket.SHUT_WR)
                 chunks = bytearray()
+                deadline = time.monotonic() + socket_timeout
+                if cancellation_event is not None:
+                    connection.settimeout(min(0.2, socket_timeout))
                 while True:
-                    chunk = connection.recv(65_536)
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise RelayError(
+                            "request_cancelled",
+                            "The MCP wait was cancelled; this does not terminate a running command.",
+                        )
+                    try:
+                        chunk = connection.recv(65_536)
+                    except socket.timeout:
+                        if cancellation_event is None or time.monotonic() >= deadline:
+                            raise
+                        continue
                     if not chunk:
                         break
                     chunks.extend(chunk)

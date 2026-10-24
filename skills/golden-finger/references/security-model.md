@@ -11,16 +11,16 @@ The MCP-facing process has no approve operation. Approval exists only as a GUI e
 ## Guarantees
 
 - Loopback-only IPC with a per-launch random bearer secret.
-- Per-request random claim capabilities: `request_id` is only a locator, and the matching `claim_token` is required to read, wait for, or cancel a request.
-- Connector-process random namespaces prevent accidental idempotency-key reuse across independently started connector processes.
+- Per-request random claim capabilities: `request_id` is only a locator, and the matching `claim_token` is required to read, wait for, cancel, or explicitly terminate a request.
+- Random namespaces isolate idempotency keys; a protected journal may retain one across connector restarts within the same host-provided thread partition. Without a stable host hint, partitions are process-local.
 - Exact package version and runtime build IDs are checked both in endpoint metadata and on every authenticated request. A source/installed or stale-window mismatch fails closed.
 - Public snapshots and the GUI expose only a short claim fingerprint; they never expose the claim token or connector instance ID.
 - Cards also show caller-supplied project/task/source labels and a derived connector fingerprint. These are human correlation evidence, not authenticated identity.
 - In-memory request payloads and results; the endpoint file contains connection metadata only.
 - Stable SHA-256 hash over the frozen request.
 - SHA-256 fingerprinting of the resolved executable at display time and again immediately before process creation.
-- SHA-256 fingerprinting and pre-launch re-verification of directly named `.ps1`, `.py`, `.pyw`, `.cmd`, and `.bat` argument files.
-- On Windows, every approved process is immediately assigned to a kill-on-close Job Object; timeout and Broker shutdown terminate the contained process tree.
+- SHA-256 fingerprinting and pre-launch re-verification of directly named `.ps1`, `.py`, `.pyw`, `.cmd`, `.bat`, `.js`, `.mjs`, and `.cjs` argument files, plus explicitly declared response files.
+- On Windows, every approved process is created suspended, assigned to a kill-on-close Job Object, and then resumed; timeout, explicit termination, and Broker shutdown terminate the contained process tree.
 - One decision per request and a frozen, hashed polling policy with an expiry time.
 - Program plus argument-array execution with \`shell=False\`.
 - Bounded runtime and bounded stdout/stderr retention.
@@ -36,19 +36,19 @@ The MCP-facing process has no approve operation. Approval exists only as a GUI e
 - This is not a replacement for Codex native approvals or sandboxing.
 - The loopback secret is same-user isolation, not protection from another process already running as the same Windows user.
 - The prototype does not cryptographically prove which physical person clicked.
-- A host-provided Codex task ID is a weak lifecycle lookup hint, not authenticated request identity or project ownership. A connector instance ID is still only a random process namespace, and authorization isolation still comes solely from the per-request claim capability.
-- The claim token is a bearer capability. A same-user process or another task that obtains the exact token can observe or cancel that request; the broker cannot distinguish legitimate transfer from theft.
-- The token necessarily travels through MCP tool results and later tool arguments, so Codex task context or diagnostic logs may retain it. The Broker itself keeps it only in memory and never places it in public snapshots or the GUI.
-- A connector restart changes its idempotency namespace. While the Broker and in-memory record still exist, an existing request can be continued with its original claim token; resubmitting the same key after restart is not guaranteed to replay the old card.
-- Commands inherit the broker process account, privilege level, environment, and filesystem/network access.
+- A host-provided Codex task ID is a weak lifecycle and local-journal lookup hint, not authenticated request identity or project ownership. A connector instance ID is only a random namespace; claim and recovery capabilities govern access.
+- The claim token is a bearer capability. A same-user process or another task that obtains the exact token can observe, cancel, or terminate that request; the broker cannot distinguish legitimate transfer from theft.
+- The token necessarily travels through MCP tool results and later tool arguments, so Codex task context or diagnostic logs may retain it. The Broker keeps it in memory and never places it in public snapshots or the GUI. The connector may retain the minimal claim/recovery credentials in its protected recovery journal; on Windows this is sealed with current-user DPAPI.
+- A connector restart can recover the protected journal when the same host-provided thread partition is available. Otherwise its namespace changes. Recovery never creates a request; an unavailable record is an unknown outcome and must not trigger automatic execution replay.
+- Commands inherit the broker process account, privilege level, and filesystem/network access. Environment variables inherit from the broker with explicit frozen overrides; complete override values are visible in local command details, while preflight and sanitized diagnostics omit their values.
 - Only direct supported script arguments are snapshotted. Imports, modules, dot-sourced files, configuration, data, and other content loaded by the program are not recursively attested.
-- There is a small operating-system scheduling interval between process creation and Job Object assignment. Assignment failure kills the new process and fails closed, but side effects that occurred in that interval cannot be rolled back.
+- The suspended-start sequence prevents user code running before Job Object assignment. Assignment or resume failure kills the newly created process and fails closed. File hashing does not make external files immutable after verification.
 - Command output is returned to the current Codex context and may be retained there even though the broker itself keeps no persistent history.
 - The broker is pull-only. It cannot wake a Codex turn that ended before the connector retrieved a terminal result.
 - The connector cannot monitor window liveness in the background. It can detect unavailability only when an active Codex turn calls health, submits, or waits.
-- MCP cancellation can be delayed by the connector's synchronous 900-second wait. Once the notification is read, cancellation is best effort and applies only while the card remains pending.
-- The window's **停止** control is distinct from MCP cancellation: it immediately changes only a pending card to `cancelled`, notifies the Broker wait condition, and expresses neither approval nor rejection. It never terminates an approved or running command.
-- Polling is fixed at 900 seconds × 10 pending polls. Legacy saved poll values are ignored, and every request retains the exact frozen policy revision, pending budget, and command timeout shown at creation.
+- MCP cancellation is processed concurrently with long waits, but the cancellation request may still fail or race with approval. The connector reports the Broker acknowledgement or failure; stopping a socket wait does not prove the pending card was cancelled.
+- The window's **停止** control immediately changes only a pending card to `cancelled`, notifies the Broker wait condition, and expresses neither approval nor rejection. An approved command instead exposes **终止**, which requires a separate confirmation. MCP `terminate_command` is also a separate, claim-protected operation; cancellation never implicitly invokes it.
+- Legacy saved poll values are ignored. Total pending validity and command timeout remain frozen; individual waits may be short, and duplicate/concurrent polls cannot expire a request before its monotonic deadline.
 - The broker cannot observe commands or output from an independently launched terminal, test supervisor, listener, or other service. This observation limit does not prohibit an otherwise allowed bounded supervisor from being the exact command the broker starts.
 - Job Object termination does not reverse filesystem, network, registry, or other side effects already performed. If the MCP result is interrupted, Codex must still treat the external outcome as uncertain and must not replay it automatically.
 - Task titles, paths, kinds, and status fields returned by Codex are untrusted display data. Sanitization and schema checks reduce accidental misuse but do not turn them into authorization evidence.
@@ -56,16 +56,20 @@ The MCP-facing process has no approve operation. Approval exists only as a GUI e
 
 The window's installation diagnostics are read-only and sanitized. They may show component versions/build IDs, cache paths, plugin enabled state, shortcut paths, elevation, runtime mode, and a derived connector fingerprint; they must never include the endpoint bearer secret, a claim token, request bodies, command output, or a raw connector instance ID.
 
-Run the broker unelevated by default. If it is intentionally launched elevated, every command request detail displays that fact and states that an approved command inherits elevation; the window does not repeat it in a separate banner.
+Run the broker unelevated by default. The window header shows the current privilege level. If it is intentionally launched elevated, command request details also state that an approved command inherits elevation.
+
+An explicit **导出脱敏操作摘要** action writes only a whitelisted summary of the current bounded in-memory history: request IDs, hashes, state, timing, exit status, and derived project hashes. It excludes command bodies, paths, output, source labels, tokens, and raw connector IDs. This is an optional local export, not automatic command-history persistence.
 
 ## Explicitly unsupported
 
 - Executing \`codex.exe\` or \`codex app-server\`.
 - Codex task routing or mutation, database edits, rollout/session inspection, deep links, authorization-driven named-pipe control, or UI automation. The sole named-pipe exception is the reviewed read-only `list_threads` lifecycle inventory described above.
 - Force-killing Codex, restarting while the inventory is unavailable/stale/partial, or exposing restart through MCP.
-- Approval through IPC, command line, environment variables, files, or any token. The model-visible claim token grants only read/wait/cancel access and never approval.
+- Approval through IPC, command line, environment variables, files, or any token. The model-visible claim token grants read/wait/cancel/terminate access and never approval.
 - Raw shell fragments.
 - Persistent command history in the broker.
 - Persistent task, project, or global routing scope in the broker.
 
 Any future feature that weakens one of these boundaries requires a new threat-model review.
+
+Recovery credentials are capabilities, not approval. Do not expose them in diagnostic exports. Recovery cannot restore a Broker record lost on process restart and does not assert that external side effects were absent. Environment overrides are part of the exact command proposal; inherited environment values are not copied into public snapshots or recovery files.

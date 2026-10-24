@@ -1,6 +1,6 @@
 {
   "name": "golden-finger",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "description": "Golden Finger for Codex — a local human-authorization relay for one-time consent and exact command execution, made for the Yes工程师 workflow.",
   "author": {
     "name": "Golden Finger for Codex Project"
@@ -19,7 +19,7 @@
       "Non-click-through Codex-themed 60% acrylic window with fully opaque text",
       "Latest-request foreground and optional sound alerts",
       "Responsive minimum-size layout with a fixed approval bar",
-      "Fixed 900-second by 10-cycle polling with an immediate in-window stop",
+      "Bounded short polling with a monotonic request deadline and an immediate in-window stop",
       "Per-request capability claiming across concurrent projects",
       "Human-readable project/task origin labels plus a non-secret connector fingerprint",
       "Exact connector/Broker version and build handshake",
