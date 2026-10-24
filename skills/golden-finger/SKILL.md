@@ -1,6 +1,6 @@
 ---
 name: golden-finger
-description: "Use Codex金手指 (Golden Finger for Codex), the Yes工程师人机授权中继, when asking for one exact human approval or rejection regardless of wording (同意/授权/批准/确认/允许/继续/拒绝 or Yes/Approve/Confirm/Authorize/Allow/Proceed/Reject), or asking the user to paste one exact allowed local command into independent system PowerShell that its shell cannot run. On first use, agree a routing scope; scope never authorizes actions. Health-check the user-launched window before every request. If unavailable or closed, fail closed and ask whether to start it and keep the scope or cancel the scope. Keep same-turn polling until terminal. Judge the frozen action/command, not words. Exclude mere acknowledgement, informational confirmation, preference questions, native Codex approvals, standing consent, this plugin's lifecycle, already-launched commands, and authorization-channel control of Codex. request_consent may relay one exact decision about a later Codex administrative action only when the authorization channel performs no Codex action."
+description: "Use Codex金手指 (Golden Finger for Codex), the Yes工程师人机授权中继, for semantic yes/no confirmations, approvals, permission to proceed, and ordered single-select questions, regardless of wording, language, keywords, or source parameter types; agreement selects the first original option. Also relay one exact allowed local command that needs the independent window. On first use agree a routing scope; scope never authorizes actions. Health-check the user-launched window before each request; if unavailable ask whether to start it or cancel the scope. Keep same-turn polling until terminal. Does not replace native Codex approvals, grant standing consent, manage this plugin's lifecycle, or answer free-text questions."
 ---
 
 # Codex金手指
@@ -17,7 +17,7 @@ English name: Golden Finger for Codex. Functional descriptor: 人机授权中继
 
 Before the first relay tool call in a Codex task, establish the Golden Finger **routing scope**. If no applicable persisted project/global scope in the active Codex instruction file and no explicit choice already exists in the current task, read [scope and window lifecycle](references/scope-lifecycle.md) and ask the user to choose `once`, `task`, `project`, `global`, or cancel. Recommend `task`; show the normalized absolute project root before offering `project`, and do not offer it when no project root is known.
 
-This bootstrap choice belongs in ordinary conversation. Never send it through `request_consent`, because selecting a scope is a preference about when to use the relay, not authorization for any action. Never infer standing consent from a scope. Every eligible action still requires its own frozen request and GUI decision.
+This bootstrap choice belongs in ordinary conversation. Never send it through a relay request: selecting a scope establishes whether the relay should be used at all. Never infer standing consent from a scope. Every eligible action or question still requires its own frozen request and GUI decision.
 
 For `project` or `global`, persist only the small marked block described in the reference, using `AGENTS.override.md` when it already exists at the target level and `AGENTS.md` otherwise. Disclose the exact active destination before writing. The block is the scope record; the Broker must not store or infer task/project scope. A project/global edit normally affects new Codex tasks, while the current task may honor the just-recorded choice immediately.
 
@@ -60,7 +60,18 @@ When maintaining code that reads, validates, snapshots, or generates against the
 
 ## Choose the request type
 
-Use \`request_consent\` when the only requested response is a natural-language authorization choice. Match the intent, not one exact token. Recall examples include 同意, 授权, 批准, 确认, 允许, 继续, 拒绝, Yes, Approve, Confirm, Authorize, Allow, Proceed, and Reject. Phrases such as “可以执行吗”, “是否批准本次操作”, “确认后继续”, and “May I proceed?” qualify when the answer decides whether one exact disclosed action may proceed. Include:
+Interpret the complete question and its options before selecting a tool. Source cards do not need a boolean parameter. Do not use a keyword whitelist, require a particular language, or infer meaning from a recommendation marker. In the agreed scope, route eligible questions through the relay **before** invoking an ordinary host question-card tool or ending the turn to ask directly. An MCP tool cannot retroactively answer a host card that has already been displayed.
+
+Use `request_decision` for an ordinary semantic yes/no confirmation or ordered single-select question. It collects an answer without running a program. Read [decision mapping](references/decision-mapping.md) when constructing these requests.
+
+- `exact_action` is the complete original question. Preserve negation, conditions, scope, and consequences; never invert “是否不再提示” into “是否继续提示”.
+- For a question whose answer is semantically yes/no, use internal `decision_type=boolean`, even if its source has no typed parameters. Give explicit `true_label` and `false_label` describing the two answers in the original question's meaning. “同意” returns `true`; “拒绝” returns `false`. A false answer is valid completion of that question, not a failed tool call.
+- When the source presents an ordered option list, use `decision_type=single_select` and copy every original option in its original order, including stable IDs, labels, descriptions, and any explicit recommendation metadata. Do not collapse two arbitrary options to a boolean. “同意” always chooses the **first original option** (`selected_index=0`), even if no option is recommended or a later option is recommended. “拒绝” selects nothing; it does not mean the second option. “停止” cancels without answering either kind.
+- A preference, design choice, or informational confirmation is eligible when it actually asks the user for a yes/no or single-select decision. A statement containing “确认” or “同意” is not itself a question. If the answer requires facts, free text, multiple selections, or resolving a genuinely ambiguous meaning, ask for the missing information through the appropriate ordinary tool; do not fabricate it or reduce it to agreement.
+- Keep one request per original question and preserve `question_id` when present. Do not let one answer approve a batch of questions or later changed choices. A structured answer is scoped only to its frozen question and never substitutes for an independent action approval.
+- Include the common `target`, `risk`, `recovery`, `idempotency_key`, `source_label`, `source_project`, and `source_task` fields. Describe what choosing the answer means; for a question with no external effect, say so directly.
+
+Use \`request_consent\` when collecting authorization for one exact disclosed later action. Match its intent regardless of wording. The result authorizes only that frozen action. Include:
 
 - \`exact_action\`: the single action the reply authorizes.
 - \`target\`: exact process, file, task, or object.
@@ -70,9 +81,9 @@ Use \`request_consent\` when the only requested response is a natural-language a
 - \`idempotency_key\`: a fresh opaque key for this request and this task. Reuse it only for an identical retry in the same connector instance.
 - `source_label`, `source_project`, and `source_task`: concise, truthful human-readable origin evidence for the shared queue. They are not authenticated identity.
 
-If you are about to ask for that decision, create the consent card before ending the turn unless a stated exclusion applies—even when the proposed reply uses a synonym not listed above. Do not fall back to direct typing merely because the later action concerns Codex. For example, “批准打开 Hook 审查终端” and “同意打开 Hook 审查终端” are both eligible for `request_consent`: the card authorizes only that later action, the authorization call itself performs no Codex action, and the current task must separately obey every applicable execution rule.
+If you are about to ask for that authorization, create the consent card before ending the turn unless a stated exclusion applies. Do not fall back to direct typing merely because the later action concerns Codex. For example, “批准打开 Hook 审查终端” and “同意打开 Hook 审查终端” are both eligible for `request_consent`: the card authorizes only that later action, the authorization call itself performs no Codex action, and the current task must separately obey every applicable execution rule.
 
-Do not trigger merely because a sentence contains an approval-like word. A receipt acknowledgement such as “收到” or “知道了”, an informational check such as “请确认版本号”, a preference or design choice, and a request for standing consent are outside this flow unless the answer specifically authorizes or rejects one exact action. When the intent remains ambiguous, ask a narrow clarifying question instead of treating the word itself as approval.
+Never use an acknowledgement such as “收到” as authorization. A request for standing consent remains outside this flow. Native Codex permissions and the relay's own scope/lifecycle choices retain their existing separate workflow.
 
 Use \`request_command_execution\` only when the window should execute a local program. Pass a program plus an argument array; never pass a shell-composed command string and never use \`shell=true\`. Resolve and disclose:
 
@@ -97,6 +108,7 @@ The Broker fingerprints the resolved executable and direct script-file arguments
 The broker is pull-only and cannot wake a Codex turn after that turn ends. Every new request returns a per-request `claim_token`; every active response includes a structured `polling` directive derived from the request's frozen window policy. The connector instance ID only namespaces submissions and is not task identity. Interpret the state:
 
 - \`approved\`: for consent, use only the returned \`reply_text\` and continue.
+- `answered`: for a question, use `result.answer`. Boolean `false` is an answer; for single-select, use the returned original `option_id` and zero-based `selected_index`. Continue according to this answer without expanding its scope.
 - \`completed\`: for commands, inspect exit code, stdout, stderr, and truncation flags before continuing.
 - \`rejected\`, \`cancelled\`, \`expired\`, \`failed\`, \`timed_out\`, or \`terminated\`: stop the authorized action and report the terminal result.
 - \`pending\` or \`running\`: this is not a stopping point. Keep the current turn open and immediately call the exact `polling.next_tool` with the exact `polling.next_arguments`. Those arguments include `request_id`, `claim_token`, and `wait_seconds`; preserve all three byte-for-byte and re-read them after every response rather than reconstructing a token or reusing a hard-coded wait. Pending requests expire only when their frozen monotonic deadline is reached; running commands continue under their separately frozen execution timeout.

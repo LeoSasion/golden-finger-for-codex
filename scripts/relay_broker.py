@@ -58,6 +58,7 @@ from codex_lifecycle import (
     normalize_codex_thread_id,
 )
 from relay_execution import BoundedOutput, WindowsJob, decode_output, start_contained_process
+from relay_decisions import decision_result, decision_summary, decision_detail
 from relay_protocol import (
     preflight_command,
     DEFAULT_PENDING_POLL_CYCLES,
@@ -1656,6 +1657,8 @@ def is_elevated() -> bool:
 
 
 def execution_mode_label(kind: str, elevated: bool) -> str:
+    if kind == "decision":
+        return "作答方式: 仅返回本题答案，不运行程序"
     if kind != "command":
         return "执行方式: 不运行程序，仅返回确认文本"
     if elevated:
@@ -2438,6 +2441,10 @@ class RequestStore:
                 "decision": "rejected",
                 "reply_text": "拒绝",
             }
+            if record.kind == "decision" and record.frozen["decision_type"] == "boolean":
+                record.state = "answered"
+                record.result = decision_result(record.frozen, False)
+                record.receipt["approval_mode"] = "manual"
             self._mark_gui_changed_locked()
             return record.public_snapshot()
 
@@ -2477,6 +2484,12 @@ class RequestStore:
                 record.receipt["approval_mode"] = "automatic"
                 record.receipt["auto_approve_wait_seconds"] = automatic_wait_seconds
             record.updated_at = now
+            if record.kind == "decision":
+                record.state = "answered"
+                record.terminal_monotonic = time.monotonic()
+                record.result = decision_result(record.frozen, True)
+                self._mark_gui_changed_locked()
+                return record.public_snapshot()
             if record.kind == "consent":
                 record.state = "approved"
                 record.terminal_monotonic = time.monotonic()
@@ -4836,6 +4849,7 @@ class RelayWindow:
             "pending": "待确认",
             "running": "执行中",
             "approved": "已同意",
+            "answered": "已作答",
             "rejected": "已拒绝",
             "cancelled": "已取消",
             "expired": "已过期",
@@ -4848,7 +4862,7 @@ class RelayWindow:
 
     @staticmethod
     def _kind_label(kind: str) -> str:
-        return "命令" if kind == "command" else "文本"
+        return {"command": "命令", "decision": "询问"}.get(kind, "文本")
 
     @staticmethod
     def _one_line(value: object, *, fallback: str = "—", limit: int = 160) -> str:
@@ -5411,13 +5425,16 @@ class RelayWindow:
         self._set_decision_summary(
             f"{source_project} · {source_task}",
             self._one_line(frozen.get("exact_action"), fallback="授权请求", limit=140),
-            "目标 · " + self._one_line(frozen.get("target"), fallback="未标注", limit=120),
+            (decision_summary(frozen) if frozen.get("kind") == "decision" else
+             "目标 · " + self._one_line(frozen.get("target"), fallback="未标注", limit=120)),
             "风险 · " + self._one_line(frozen.get("risk"), fallback="未标注", limit=110),
         )
         parameter_count = 6
         if frozen.get("kind") == "command":
             arguments = frozen.get("arguments")
             parameter_count = 8 + (len(arguments) if isinstance(arguments, list) else 0)
+        elif frozen.get("kind") == "decision":
+            parameter_count = 7 + len(frozen.get("options", []))
         marker = "‹" if self._detail_expanded else "›"
         preview_hint = " · 含省略" if self._summary_has_ellipsis else ""
         self.detail_toggle_button.configure(
@@ -5452,7 +5469,7 @@ class RelayWindow:
             f"策略版本: {poll_policy['policy_revision']}",
             permission_line,
             "",
-            "唯一动作:",
+            "原始问题:" if frozen["kind"] == "decision" else "唯一动作:",
             str(frozen["exact_action"]),
             "",
             "精确目标:",
@@ -5472,6 +5489,8 @@ class RelayWindow:
                     str(frozen["approved_reply"]),
                 ]
             )
+        elif frozen["kind"] == "decision":
+            lines.extend(["", *decision_detail(frozen)])
         else:
             command = [frozen["executable"], *frozen["arguments"]]
             lines.extend(
@@ -5558,6 +5577,9 @@ class RelayWindow:
             }.get(detail.get("execution_phase"), "命令执行中 · 可单独终止")
         elif detail["state"] == "terminated":
             state_text = "已终止执行 · 已发生的更改未撤销"
+        elif detail["state"] == "answered":
+            reply = (detail.get("result") or {}).get("reply_text", "")
+            state_text = "已作答 · " + self._one_line(reply, fallback="本题答案", limit=70)
         elif (
             detail["state"] == "cancelled"
             and isinstance(detail.get("result"), dict)

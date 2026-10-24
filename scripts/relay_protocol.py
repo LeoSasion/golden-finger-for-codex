@@ -27,7 +27,7 @@ from typing import Any
 from release_metadata import VERSION, source_build_id
 
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 PACKAGE_VERSION = VERSION
 PACKAGE_BUILD_ID = "source"
 PRODUCT_NAME = "GoldenFinger"
@@ -54,6 +54,7 @@ MIN_PENDING_POLL_CYCLES = 10
 DEFAULT_PENDING_POLL_CYCLES = 10
 MAX_PENDING_POLL_CYCLES = 10
 TERMINAL_STATES = {
+    "answered",
     "approved",
     "rejected",
     "cancelled",
@@ -786,8 +787,8 @@ def windows_command_line_units(executable: str, arguments: list[str]) -> int:
 def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
     """Validate, resolve, and freeze a request before it is displayed."""
 
-    if kind not in {"consent", "command"}:
-        raise RelayError("invalid_request", "kind must be consent or command.")
+    if not isinstance(kind, str) or kind not in {"consent", "command", "decision"}:
+        raise RelayError("invalid_request", "kind must be consent, command or decision.")
     if not isinstance(payload, dict):
         raise RelayError("invalid_request", "payload must be an object.")
 
@@ -805,6 +806,8 @@ def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
     kind_fields = (
         {"approved_reply"}
         if kind == "consent"
+        else {"decision_type", "question_id", "options", "true_label", "false_label"}
+        if kind == "decision"
         else {
             "executable",
             "arguments",
@@ -866,6 +869,9 @@ def normalize_request(kind: Any, payload: Any) -> dict[str, Any]:
             "approved_reply",
             maximum=200,
         )
+    elif kind == "decision":
+        from relay_decisions import normalize_decision
+        frozen.update(normalize_decision(payload))
     else:
         arguments = payload.get("arguments")
         if not isinstance(arguments, list):

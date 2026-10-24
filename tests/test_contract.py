@@ -1576,6 +1576,7 @@ class MCPShapeTests(unittest.TestCase):
             {
                 "relay_health",
                 "request_consent",
+                "request_decision",
                 "request_command_execution",
                 "wait_for_authorization",
                 "cancel_authorization",
@@ -1604,7 +1605,7 @@ class MCPShapeTests(unittest.TestCase):
 
     def test_new_request_schemas_require_cross_project_source_evidence(self) -> None:
         tools_by_name = {tool["name"]: tool for tool in TOOLS}
-        for name in ("request_consent", "request_command_execution"):
+        for name in ("request_consent", "request_decision", "request_command_execution"):
             schema = tools_by_name[name]["inputSchema"]
             for field in ("source_label", "source_project", "source_task"):
                 self.assertIn(field, schema["required"])
@@ -1987,7 +1988,7 @@ class MCPShapeTests(unittest.TestCase):
         self.assertEqual(response["result"]["protocolVersion"], "2025-06-18")
         self.assertEqual(response["result"]["capabilities"], {"tools": {"listChanged": False}})
         self.assertEqual(response["result"]["serverInfo"]["version"], PACKAGE_VERSION)
-        self.assertEqual(PROTOCOL_VERSION, 7)
+        self.assertEqual(PROTOCOL_VERSION, 8)
 
 
 class ReleasePackagingTests(unittest.TestCase):

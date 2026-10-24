@@ -193,7 +193,7 @@ class AutoApprovalTests(unittest.TestCase):
 
     def test_mcp_descriptions_disclose_automatic_approval_instead_of_claiming_a_click(self):
         tools = {tool["name"]: tool for tool in relay_mcp_server.TOOLS}
-        for name in ("request_consent", "request_command_execution"):
+        for name in ("request_consent", "request_decision", "request_command_execution"):
             with self.subTest(tool=name):
                 self.assertIn("automatic", tools[name]["description"])
                 self.assertIn("receipt.approval_mode", tools[name]["description"])

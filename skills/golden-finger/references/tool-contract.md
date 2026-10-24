@@ -34,6 +34,14 @@ Required fields: \`exact_action\`, \`target\`, \`risk\`, \`recovery\`, \`idempot
 
 The shipped policy caps pending validity at 9,000 seconds. There are no mutable window polling inputs; legacy saved values are ignored. The broker freezes this policy when it creates the request; caller-supplied validity may shorten it. A tool call may return \`pending\` before the monotonic deadline; neither repeated nor concurrent polls shorten that validity.
 
+## request_decision
+
+Collects one ordinary semantic yes/no or ordered single-select answer. The model normalizes the original question by meaning; the source need not have boolean parameters or particular keywords. `exact_action` preserves the full question. Use common request fields plus `decision_type=boolean` (optional distinct `true_label` / `false_label`) or `decision_type=single_select` (1–20 ordered `options` with unique IDs and labels). Optional `question_id` is echoed. See [decision mapping](decision-mapping.md).
+
+Agreement returns `state=answered` and typed `result.answer`: boolean `value=true`, or the original first option's ID, label and zero-based `selected_index=0`. Recommendation metadata never reorders choices. Boolean rejection is `answered` with `value=false`; single-select rejection has no selected answer. Stop cancels without answering. No path executes a program or replaces native Codex permissions. Frozen question, labels and option order participate in the request hash and idempotency check.
+
+The existing window timer is unchanged and applies to these cards; an automatic answer is disclosed in `receipt.approval_mode` and is not a human click. Already displayed host cards are not intercepted. Free text and multi-select require the appropriate ordinary host question flow.
+
 ## request_command_execution
 
 Creates one command card. Approval executes the frozen \`executable\` and \`arguments\` with \`shell=False\`.
@@ -79,6 +87,12 @@ Explicitly terminates only the command identified by its matching `request_id` a
 For command requests:
 
 \`pending -> running -> completed | failed | timed_out | terminated\`
+
+For decision questions:
+
+`pending -> answered | rejected | cancelled | expired`
+
+`answered` is terminal for both boolean true/false and the first-option selection. Its `result.answer` is an answer to the frozen question, not blanket action authorization.
 
 Terminal snapshots include the request ID, claim fingerprint, request hash, timestamps, and decision receipt. Approved snapshots distinguish `receipt.approval_mode=manual` (with `human_action=approved_once`) from `receipt.approval_mode=automatic` (with `auto_approve_wait_seconds` and no `human_action`). An automatic receipt is not proof of explicit human confirmation. Command snapshots additionally include exit code, stdout, stderr, and truncation flags. Public snapshots never contain the claim token or connector instance ID.
 

@@ -1,4 +1,4 @@
-"""Isolated release MCP roundtrip; no GUI, approvals or command execution."""
+"""Isolated release MCP roundtrip; synthetic question answers, no GUI or commands."""
 
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ def require(condition, description):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--package", type=Path, default=Path("dist/golden-finger-0.3.1"))
-    parser.add_argument("--output", type=Path, default=Path("build/exe-integration-031-result.json"))
+    parser.add_argument("--package", type=Path, default=Path("dist/golden-finger-0.4.0"))
+    parser.add_argument("--output", type=Path, default=Path("build/exe-integration-040-result.json"))
     options = parser.parse_args()
     workspace = Path(__file__).resolve().parents[1]
     build_root = (workspace / "build").resolve()
@@ -54,6 +54,7 @@ def main():
         "business_commands_executed": 0,
         "gui_opened": False,
         "approval_performed": False,
+        "synthetic_question_answers": 0,
     }
     original_localappdata = os.environ.get("LOCALAPPDATA")
     process = None
@@ -287,6 +288,50 @@ def main():
         require(checked.get("ok") is True and checked.get("executed") is False, "EXE preflight failed")
         require("DO-NOT-ECHO" not in json.dumps(checked), "Preflight disclosed environment values")
         report["checks"].append("preflight_read_only_and_redacted")
+
+        decision_base = {
+            "exact_action": "Synthetic question: should prompting stop?",
+            "target": "Isolated in-memory preference", "risk": "No action or command execution",
+            "recovery": "Discard test fixture", "source_label": "release-test",
+            "source_project": "isolated-fixture", "source_task": "typed question receipt",
+            "wait_seconds": 0,
+        }
+        decision_cases = [
+            ({"decision_type": "boolean", "true_label": "Stop prompting", "false_label": "Keep prompting"},
+             "reject", "answered", {"type": "boolean", "value": False}),
+            ({"decision_type": "single_select", "options": [
+                {"id": "first", "label": "Keep existing"},
+                {"id": "second", "label": "Change (Recommended)", "recommended": True}]},
+             "approve", "answered", {"type": "single_select", "selected_index": 0,
+                                      "option_id": "first", "label": "Keep existing"}),
+            ({"decision_type": "single_select", "options": [
+                {"id": "first", "label": "Keep existing"}, {"id": "second", "label": "Change"}]},
+             "reject", "rejected", None),
+            ({"decision_type": "boolean"}, "stop", "cancelled", None),
+        ]
+        for index, (variant, action, terminal, expected_answer) in enumerate(decision_cases):
+            rpc_id = 20 + index * 2
+            args = {**decision_base, **variant, "idempotency_key": f"release-decision-{index}"}
+            send({"jsonrpc": "2.0", "id": rpc_id, "method": "tools/call",
+                  "params": {"name": "request_decision", "arguments": args}})
+            pending_decision = structured(receive(rpc_id))
+            require(pending_decision.get("request", {}).get("state") == "pending", "Decision EXE submission failed")
+            request_id = pending_decision["request"]["request_id"]
+            # The harness decides only its own synthetic, side-effect-free test
+            # question in its isolated store. No user approval is simulated.
+            {"approve": store.approve_from_gui, "reject": store.reject_from_gui,
+             "stop": store.cancel_from_gui}[action](request_id)
+            send({"jsonrpc": "2.0", "id": rpc_id + 1, "method": "tools/call",
+                  "params": {"name": "wait_for_authorization",
+                             "arguments": pending_decision["polling"]["next_arguments"]}})
+            final_decision = structured(receive(rpc_id + 1))
+            require(final_decision["request"]["state"] == terminal, "Decision state changed in MCP transport")
+            require(final_decision["request"]["result"].get("answer") == expected_answer, "Decision answer lost meaning or option order")
+            require(final_decision["polling"]["terminal"] is True, "Decision answer was not treated as terminal")
+            require(store.detail_for_gui(request_id).get("process") is None, "Question unexpectedly spawned a process")
+            report["synthetic_question_answers"] += 1
+        report["checks"].append("semantic_boolean_false_first_option_reject_stop_roundtrip")
+        require(all(record.process is None for record in store._records.values()), "Fixture spawned an unexpected process")
         written_files = {path.relative_to(temporary_path).as_posix() for path in temporary_path.rglob("*") if path.is_file()}
         require("GoldenFinger/endpoint.json" in written_files, "Fixture endpoint is missing")
         require(all(name == "GoldenFinger/endpoint.json" or (name.startswith("GoldenFinger/recovery/") and name.endswith((".sealed", ".lock"))) for name in written_files), "Fixture unexpectedly wrote settings or other state")

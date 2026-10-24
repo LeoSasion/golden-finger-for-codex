@@ -4,7 +4,7 @@
 
 从项目 GitHub Releases 获取完整 Windows x64 ZIP，解压后运行 `bin\GoldenFinger.exe`。保留 `golden-finger.runtime` 和配套 MCP EXE。主界面会显示普通用户或管理员权限；执行命令继承窗口权限。
 
-本轮没有更改自动审批计时、策略、默认值或配置迁移。需要了解既有审批方式时，请查看 README 的“轮询与执行设置”。
+本轮没有更改自动审批计时、策略、默认值或配置迁移。日常操作见 README 的“想自己点，还是让倒计时帮忙？”，完整策略见[技术说明](TECHNICAL-REFERENCE.md#轮询与执行设置)。
 
 ## 稳定安装目录
 
@@ -33,6 +33,8 @@
 4. 在要使用的聊天中调用 `relay_health`。窗口与连接器必须匹配版本和 build ID。
 5. 提交一条仅返回文字的请求，确认该聊天收到终态结果。旧连接记录或任务线索不能证明新的聊天已经接入。
 
+让 Agent 代为安装时，可直接复制[首页开头的安装提示词](../README.md)。它可以完成下载、SHA-256 校验和安装，再按当前客户端支持的插件市场或安装入口接入；需要在客户端点击安装、刷新或重启时，应明确交接。插件接入方式以 [OpenAI 官方文档](https://developers.openai.com/plugins/build/plugins) 为准，不能把写入安装文件等同于插件已在当前聊天启用。
+
 如需复制完整活动插件到另一个导入目录：
 
 ```powershell
@@ -46,7 +48,7 @@
 更新前结束或明确终止正在运行的请求，正常关闭窗口及旧 MCP 连接器。安装器遇到安装根内的运行中 EXE 会拒绝切换版本。
 
 ```powershell
-.\bin\GoldenFingerSetup.exe install D:\Downloads\golden-finger-0.3.1-windows-x64.zip --root "$env:LOCALAPPDATA\GoldenFingerApp"
+.\bin\GoldenFingerSetup.exe install D:\Downloads\golden-finger-0.4.0-windows-x64.zip --root "$env:LOCALAPPDATA\GoldenFingerApp"
 .\bin\GoldenFingerSetup.exe rollback --root "$env:LOCALAPPDATA\GoldenFingerApp"
 ```
 
@@ -92,4 +94,4 @@
 
 发行构建采用固定 Python 版本，CI 单测覆盖 3.13 和 3.14。以下环境需要在对应机器手工验收，不能由本机测试代替：Windows 10/11 干净安装、多显示器、100%/150%/200% DPI、屏幕阅读器、受限组织策略、托盘重启恢复。
 
-0.3.1 的短等待、恢复、环境预检、输出分页与损坏修复见 [迭代指南](ITERATION-031.md)。长期运行验证按用户要求后续安排。
+0.4.0 的语义确认、按钮映射和原始首项选择见[问询映射](../skills/golden-finger/references/decision-mapping.md)。本轮协议为 8，窗口与连接器需配套升级；不能与 0.3.1 混用。0.3.1 的短等待、恢复、环境预检、输出分页与损坏修复见 [迭代指南](ITERATION-031.md)。5 秒行为保持不变，长期运行验证按用户要求后续安排。

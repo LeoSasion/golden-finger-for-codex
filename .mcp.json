@@ -2,7 +2,7 @@
   "mcpServers": {
     "golden_finger": {
       "title": "Codex金手指",
-      "description": "Golden Finger for Codex: connect Codex to the separately launched human-authorization relay window for the Yes工程师 workflow.",
+      "description": "Golden Finger for Codex: semantic confirmations, original-first-option questions, and exact one-time approvals in the separately launched Yes工程师 relay window.",
       "command": "python",
       "args": [
         "-u",

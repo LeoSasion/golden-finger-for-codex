@@ -64,34 +64,22 @@ def validate_skill_metadata() -> None:
     require(metadata.get("name") == "golden-finger", "wrong Skill name")
     description = metadata.get("description", "")
     require(
-        "one exact human approval or rejection regardless of wording" in description,
-        "Skill trigger must be authorization-intent-first",
-    )
-    trigger_examples = (
-        "同意",
-        "授权",
-        "批准",
-        "确认",
-        "允许",
-        "继续",
-        "拒绝",
-        "Yes",
-        "Approve",
-        "Confirm",
-        "Authorize",
-        "Allow",
-        "Proceed",
-        "Reject",
+        "semantic yes/no" in description
+        and "single-select" in description
+        and "source parameter types" in description,
+        "Skill must route semantic questions independently of source types",
     )
     require(
-        all(example in description for example in trigger_examples),
-        "Skill trigger examples are incomplete",
+        "first original option" in description
+        and "native Codex approvals" in description
+        and "free-text questions" in description,
+        "Skill decision mapping and native/free-text boundaries are missing",
     )
     require(
-        "mere acknowledgement" in description
-        and "informational confirmation" in description
-        and "preference questions" in description,
-        "Skill trigger false-positive boundaries are incomplete",
+        "request_decision" in source
+        and "references/decision-mapping.md" in source
+        and (PLUGIN_ROOT / "skills/golden-finger/references/decision-mapping.md").is_file(),
+        "Skill decision tool guidance is missing",
     )
     require("same-turn polling until terminal" in description, "Skill polling trigger is missing")
     require(
@@ -499,7 +487,7 @@ def validate_python_sources() -> None:
     )
 
     protocol_source = load_utf8(PLUGIN_ROOT / "scripts" / "relay_protocol.py")
-    require("PROTOCOL_VERSION = 7" in protocol_source, "relay protocol version must be 7")
+    require("PROTOCOL_VERSION = 8" in protocol_source, "relay protocol version must be 8")
     require(
         'PACKAGE_VERSION = VERSION' in protocol_source,
         "package version drifted",
@@ -559,6 +547,20 @@ def validate_python_sources() -> None:
     )
 
     readme = load_utf8(PLUGIN_ROOT / "README.md")
+    hero_position = readme.find("assets/readme-hero.png")
+    title_position = readme.find("# Codex金手指")
+    require(
+        readme.startswith("![")
+        and 0 <= hero_position < title_position,
+        "README must retain the fixed hero before the project title",
+    )
+    require(
+        0 <= readme.find("```text") < readme.find("## 少打几个"),
+        "README must lead with the copyable Agent installation prompt",
+    )
+    for marker in ("GoldenFingerSetup.exe", "SHA-256", "docs/LOCAL-GUIDE.md", "docs/TECHNICAL-REFERENCE.md"):
+        require(marker in readme, f"README installation guidance is missing {marker!r}")
+    technical_guide = load_utf8(PLUGIN_ROOT / "docs" / "TECHNICAL-REFERENCE.md")
     for launcher_marker in (
         "launch_relay.pyw",
         "pythonw.exe",
@@ -566,8 +568,8 @@ def validate_python_sources() -> None:
         "版本化缓存目录",
     ):
         require(
-            launcher_marker in readme,
-            f"README launcher guidance is missing {launcher_marker!r}",
+            launcher_marker in technical_guide,
+            f"Technical launcher guidance is missing {launcher_marker!r}",
         )
     for ui_marker in (
         "appearanceTheme",
@@ -590,7 +592,7 @@ def validate_python_sources() -> None:
         "权限横幅已移除",
         "claim_token",
         "认领指纹",
-        "协议版本 7",
+        "协议版本 8",
         "Job Object",
         "直接命名",
         "右上角“接入检查”",
@@ -601,7 +603,7 @@ def validate_python_sources() -> None:
         "取消金手指作用域",
         "不能在 Codex 回合结束后后台监测",
     ):
-        require(ui_marker in readme, f"README UI guidance is missing {ui_marker!r}")
+        require(ui_marker in technical_guide, f"Technical UI guidance is missing {ui_marker!r}")
 
     build_source = load_utf8(PLUGIN_ROOT / "scripts" / "build_windows_release.py")
     verify_source = load_utf8(PLUGIN_ROOT / "scripts" / "verify_windows_release.py")

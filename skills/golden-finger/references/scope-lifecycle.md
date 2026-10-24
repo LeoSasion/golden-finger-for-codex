@@ -28,7 +28,7 @@ For `project` or `global`, first resolve the target level: the normalized projec
 <!-- golden-finger-scope:start -->
 ## Codex金手指使用作用域
 
-- The user selected `$golden-finger` as a routing preference for this AGENTS.md scope. For each eligible action, follow the installed Skill, require a separate one-time window decision, and never treat this scope as action authorization.
+- The user selected `$golden-finger` as a routing preference for this AGENTS.md scope. For each eligible action or semantic yes/no or ordered single-select question, follow the installed Skill, require a separate one-time window decision, and never treat this scope as action authorization. Agreement selects the original first option without reordering.
 - If the independent window is unavailable, fail closed and ask whether to start it and keep this scope or remove this marked scope block. Do not use the relay for its own lifecycle or as a substitute for native Codex approval.
 <!-- golden-finger-scope:end -->
 ```

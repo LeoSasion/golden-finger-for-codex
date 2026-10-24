@@ -96,12 +96,14 @@ SERVER_INSTRUCTIONS = (
     "rollout。首次采用时必须先在普通对话中约定金手指的使用作用域；作用域只决定何时路由，"
     "绝不是动作授权。窗口必须由用户独立启动；每次准备提交前先检查 relay_health。不可达时"
     "失败关闭，并让用户选择启动窗口后保留作用域，或取消作用域；不得自动启动、不得把取消"
-    "作用域解释为批准或拒绝当前动作。request_consent 返回当前工具"
-    "调用里的文本决定；request_command_execution 仅在窗口点击后以 shell=False 执行"
+    "作用域解释为批准或拒绝当前动作。request_decision 按完整语义归一化普通是/否和有序选项问询，"
+    "不要求源参数是布尔类型，也不依赖关键词；同意选择原始第一项。answered 的布尔 false 也是有效答案。"
+    "不能接管已经显示的宿主卡片。request_consent 返回当前工具"
+    "调用里的文本决定；request_command_execution 经窗口手动或配置的自动审批后以 shell=False 执行"
     "冻结的 executable+arguments。中继是拉取式机制，不会唤醒已经结束的 Codex 回合。"
     "pending/running 是非终态：必须保持当前回合，逐字复用 polling.next_arguments "
-    "wait_for_authorization，直到 completed/approved/rejected/cancelled/expired/failed/"
-    "timed_out；活动状态下不得返回最终答复、不得让用户额外发送‘已完成’，也不要以新 key "
+    "wait_for_authorization，直到 answered/completed/approved/rejected/cancelled/expired/failed/"
+    "timed_out/terminated；活动状态下不得返回最终答复、不得让用户额外发送‘已完成’，也不要以新 key "
     "重提或把 request_id/claim_token 转交其他任务。request_id 仅用于定位，claim_token 才是"
     "当前请求的认领凭据。中继只返回自身启动的命令结果，不能观察由其他终端或服务启动的进程；"
     "这不限制它在精确一次性批准后自行启动允许的有界测试或测试 supervisor。"
@@ -322,6 +324,46 @@ TOOLS: list[dict[str, Any]] = [
             "idempotentHint": True,
             "openWorldHint": False,
         },
+    },
+    {
+        "name": "request_decision",
+        "title": "转发一次语义确认或选项问询",
+        "description": (
+            "Route an ordinary user question by its meaning, never by keyword or the source card's schema. "
+            "Normalize a semantic yes/no confirmation to boolean; normalize any ordered options to single_select. "
+            "Keep the full original question and option order. A GUI agreement or configured automatic timer "
+            "returns true or the FIRST original option, regardless of recommended labels. Boolean rejection "
+            "answers false; single_select rejection chooses nothing. Stop cancels without an answer. "
+            "An answered result records only this question's answer and executes no program. "
+            "Read receipt.approval_mode: automatic is not evidence of a human click. "
+            "This does not intercept existing host cards or replace native Codex permission approvals. "
+            "Pending results require same-turn polling."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                **COMMON_PROPERTIES,
+                "exact_action": {"type": "string", "minLength": 1, "maxLength": 4000,
+                                 "description": "Full original question, including negation and scope. This is not a command to execute."},
+                "decision_type": {"type": "string", "enum": ["boolean", "single_select"],
+                                  "description": "Internal normalization of the question's semantics; does not require a boolean source parameter."},
+                "question_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "true_label": {"type": "string", "minLength": 1, "maxLength": 200, "default": "是"},
+                "false_label": {"type": "string", "minLength": 1, "maxLength": 200, "default": "否"},
+                "options": {"type": "array", "minItems": 1, "maxItems": 20,
+                            "description": "Original options in original order. Never sort by recommendation or wording.",
+                            "items": {"type": "object", "properties": {
+                                "id": {"type": "string", "minLength": 1, "maxLength": 128},
+                                "label": {"type": "string", "minLength": 1, "maxLength": 500},
+                                "description": {"type": "string", "minLength": 1, "maxLength": 1000},
+                                "recommended": {"type": "boolean", "default": False},
+                            }, "required": ["id", "label"], "additionalProperties": False}},
+            },
+            "required": [*COMMON_REQUIRED, "decision_type"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False,
+                        "idempotentHint": True, "openWorldHint": False},
     },
     {
         "name": "request_command_execution",
@@ -956,6 +998,12 @@ def _continuation_for(snapshot: dict[str, Any], claim_token: str, wait_seconds: 
         )
     if state == "approved":
         return "Use only result.reply_text as the answer to this exact consent request."
+    if state == "answered":
+        return (
+            "Use result.answer for this exact original question. Boolean false is a valid answer, not a failed call. "
+            "single_select selected_index is zero-based in the original option order. Continue the task using that "
+            "answer without treating it as permission for unrelated actions or a native approval."
+        )
     if state == "completed":
         return "Inspect exit_code, stdout, stderr, and truncation flags before continuing."
     if _scope_recovery_for_snapshot(snapshot) is not None:
@@ -1058,6 +1106,11 @@ def call_tool(
             "consent",
             arguments,
             rpc_request_id=rpc_request_id,
+            codex_thread_id=codex_thread_id,
+        )
+    if name == "request_decision":
+        return _request_and_wait(
+            "decision", arguments, rpc_request_id=rpc_request_id,
             codex_thread_id=codex_thread_id,
         )
     if name == "request_command_execution":
@@ -1379,7 +1432,7 @@ class McpDispatcher:
                 progress_token = None
             _ACTIVE_RPC_CALLS[key] = _RpcCallState(
                 progress_token=progress_token, progress_owner=self,
-                progress_phase="submitting" if tool_name in {"request_consent", "request_command_execution"} else "waiting",
+                progress_phase="submitting" if tool_name in {"request_consent", "request_decision", "request_command_execution"} else "waiting",
             )
         worker = threading.Thread(
             target=self._run, args=(key, message, slots), daemon=True, name="mcp-request"

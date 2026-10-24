@@ -1,15 +1,15 @@
 {
   "name": "golden-finger",
-  "version": "0.3.1",
-  "description": "Golden Finger for Codex — a local human-authorization relay for one-time consent and exact command execution, made for the Yes工程师 workflow.",
+  "version": "0.4.0",
+  "description": "Golden Finger for Codex — semantic confirmations, original-first-option answers, one-time consent and exact local command execution for the Yes工程师 workflow.",
   "author": {
     "name": "Golden Finger for Codex Project"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "Codex\u91d1\u624b\u6307",
-    "shortDescription": "\u4eba\u673a\u6388\u6743\u4e2d\u7ee7\uff1aYes\u5de5\u7a0b\u5e08\u7684\u4e00\u952e\u786e\u8ba4\u4e0e\u547d\u4ee4\u6388\u6743\u7a97\u53e3",
-    "longDescription": "Codex\u91d1\u624b\u6307\uff08Golden Finger for Codex\uff09\u662f\u4e3a Yes\u5de5\u7a0b\u5e08\u51c6\u5907\u7684\u4eba\u673a\u6388\u6743\u4e2d\u7ee7\u3002\u5b83\u628a Codex \u63d0\u8bae\u7684\u5355\u6b21\u547d\u4ee4\u6216\u81ea\u7136\u8bed\u8a00\u6388\u6743\u8bf7\u6c42\u9001\u5230\u72ec\u7acb\u7a97\u53e3\uff0c\u51bb\u7ed3\u5e76\u5c55\u793a\u5b8c\u8bf7\u6c42\uff1b\u53ea\u6709\u7528\u6237\u70b9\u51fb\u201c\u540c\u610f\u672c\u6b21\u201d\u540e\u624d\u8fd4\u56de\u540c\u610f\u6216\u6267\u884c\u7cbe\u786e\u547d\u4ee4\uff0c\u5e76\u7531\u5f53\u524d Codex \u56de\u5408\u6301\u7eed\u62c9\u53d6\u5230\u7ec8\u6001\u3002",
+    "displayName": "Codex金手指",
+    "shortDescription": "人机授权中继：Yes工程师的一键确认与命令授权窗口",
+    "longDescription": "Codex金手指（Golden Finger for Codex）是 Yes工程师的人机授权中继。它按完整语义把普通确认、审批和有序选项问询交给独立窗口，不依赖关键词或源参数类型；同意选择原始第一项。窗口冻结并显示问题、选项及按钮映射，返回结构化答案、单次授权或执行精确命令。支持用户点击和窗口配置的自动审批，自动回执不代表人工点击；当前 Codex 回合持续轮询到终态。",
     "developerName": "Golden Finger for Codex Project",
     "category": "Productivity",
     "capabilities": [
@@ -27,11 +27,12 @@
       "Windows Job Object process-tree containment",
       "Sanitized in-window installation diagnostics",
       "Self-contained Windows EXE release build and clean-machine verification",
-      "Intent-based one-time consent triggering across common Chinese and English approval wording",
-      "User-global plugin runtime with first-use routing scopes and structured start-window or cancel-scope recovery"
+      "Semantic yes/no and ordered single-select question routing, independent of keywords and source parameter types",
+      "User-global plugin runtime with first-use routing scopes and structured start-window or cancel-scope recovery",
+      "Typed answers preserving original question, negation, option IDs and first-option order"
     ],
     "defaultPrompt": [
-      "\u4f7f\u7528 Codex\u91d1\u624b\u6307\uff08\u4eba\u673a\u6388\u6743\u4e2d\u7ee7\uff09\u5904\u7406\u5f53\u524d\u52a8\u4f5c\uff1b\u9996\u6b21\u91c7\u7528\u5148\u7ea6\u5b9a\u4f7f\u7528\u4f5c\u7528\u57df\u5e76\u68c0\u67e5\u7a97\u53e3\uff0c\u4e0d\u53ef\u8fbe\u65f6\u8be2\u95ee\u542f\u52a8\u6216\u53d6\u6d88\u4f5c\u7528\u57df\uff1bpending/running \u6309\u54cd\u5e94\u53c2\u6570\u8f6e\u8be2\u5230\u7ec8\u6001\u3002"
+      "使用 Codex金手指按语义处理审批与问询；同意选择原始第一项。首次先约定作用域并检查窗口；pending/running 按响应参数轮询到终态。"
     ]
   },
   "mcpServers": "./.mcp.json"
