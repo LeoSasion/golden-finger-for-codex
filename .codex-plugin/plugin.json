@@ -1,6 +1,6 @@
 {
   "name": "golden-finger",
-  "version": "0.4.0",
+  "version": "0.5.1",
   "description": "Golden Finger for Codex — semantic confirmations, original-first-option answers, one-time consent and exact local command execution for the Yes工程师 workflow.",
   "author": {
     "name": "Golden Finger for Codex Project"
@@ -29,7 +29,10 @@
       "Self-contained Windows EXE release build and clean-machine verification",
       "Semantic yes/no and ordered single-select question routing, independent of keywords and source parameter types",
       "User-global plugin runtime with first-use routing scopes and structured start-window or cancel-scope recovery",
-      "Typed answers preserving original question, negation, option IDs and first-option order"
+      "Typed answers preserving original question, negation, option IDs and first-option order",
+      "Actionable first-success guide and sanitized Agent repair prompts",
+      "Claim-bound connector receipts without claiming host Agent progress",
+      "Compact decision view, stable interaction selection and isolated practice mode"
     ],
     "defaultPrompt": [
       "使用 Codex金手指按语义处理审批与问询；同意选择原始第一项。首次先约定作用域并检查窗口；pending/running 按响应参数轮询到终态。"

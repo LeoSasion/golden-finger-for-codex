@@ -137,6 +137,9 @@ class RecoveryAndToolTests(unittest.TestCase):
                     return {"ok": True, "request": owner.store.status(kwargs["request_id"], kwargs["claim_token"])}
                 if operation == "cancel":
                     return {"ok": True, "request": owner.store.cancel(kwargs["request_id"], kwargs["claim_token"])}
+                if operation == "acknowledge_receipt":
+                    return {"ok": True, "request": owner.store.acknowledge_receipt(
+                        kwargs["request_id"], kwargs["claim_token"], kwargs["request_hash"], kwargs["observed_state"])}
                 if operation == "preflight":
                     return {"ok": True, "preflight": kwargs["payload"]}
                 if operation == "read_output":

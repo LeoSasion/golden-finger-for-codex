@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 import tempfile
 
-DEFAULTS = {"raise_on_request": True, "topmost_pending": True, "select_new_request": True}
+DEFAULTS = {"raise_on_request": True, "topmost_pending": True,
+            "select_new_request": True, "compact_mode": False}
 
 
 def load_preferences(path: Path) -> dict[str, bool]:

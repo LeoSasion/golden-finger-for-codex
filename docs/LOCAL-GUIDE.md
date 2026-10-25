@@ -48,7 +48,7 @@
 更新前结束或明确终止正在运行的请求，正常关闭窗口及旧 MCP 连接器。安装器遇到安装根内的运行中 EXE 会拒绝切换版本。
 
 ```powershell
-.\bin\GoldenFingerSetup.exe install D:\Downloads\golden-finger-0.4.0-windows-x64.zip --root "$env:LOCALAPPDATA\GoldenFingerApp"
+.\bin\GoldenFingerSetup.exe install D:\Downloads\golden-finger-0.5.1-windows-x64.zip --root "$env:LOCALAPPDATA\GoldenFingerApp"
 .\bin\GoldenFingerSetup.exe rollback --root "$env:LOCALAPPDATA\GoldenFingerApp"
 ```
 
@@ -94,4 +94,15 @@
 
 发行构建采用固定 Python 版本，CI 单测覆盖 3.13 和 3.14。以下环境需要在对应机器手工验收，不能由本机测试代替：Windows 10/11 干净安装、多显示器、100%/150%/200% DPI、屏幕阅读器、受限组织策略、托盘重启恢复。
 
-0.4.0 的语义确认、按钮映射和原始首项选择见[问询映射](../skills/golden-finger/references/decision-mapping.md)。本轮协议为 8，窗口与连接器需配套升级；不能与 0.3.1 混用。0.3.1 的短等待、恢复、环境预检、输出分页与损坏修复见 [迭代指南](ITERATION-031.md)。5 秒行为保持不变，长期运行验证按用户要求后续安排。
+0.4.0 引入的语义确认、按钮映射和原始首项选择见[问询映射](../skills/golden-finger/references/decision-mapping.md)，该历史版本使用协议 8。当前 0.5.1 的协议和操作见下节，窗口与连接器必须配套升级。0.3.1 的短等待、恢复、环境预检、输出分页与损坏修复见 [迭代指南](ITERATION-031.md)。5 秒行为保持不变，长期运行验证按用户要求后续安排。
+
+## 0.5.0 接入与日常操作
+
+- 接入检查先显示可执行的引导，提供复制聊天测试和修复任务；详细诊断继续保留。只有真实连接器取回回执，才显示最近实测成功；此证据不认证当前聊天，也不代表 Agent 已执行后续动作。
+- 顶部可切换紧凑模式和完整视图。紧凑模式隐藏队列与维护区，查看队列会恢复完整视图；视图偏好独立保存，不改变自动审批参数。
+- 操作按钮、键盘选择或查看详情时保护当前请求，新请求仍加入队列并提醒。
+- 更多中的演示只在独立的本地练习状态运行，没有真实请求、命令、连接器或审批回执。演示完成后请复制测试提示词，在实际聊天验证。
+- 快捷键：F1 打开接入引导，F2 切换视图，F3 打开演示；引导窗口内 Ctrl+C 复制测试提示词、F5 刷新、Page Up/Down 滚动、Esc 关闭。
+- 本版协议为 9；窗口与连接器需使用同一 0.5.1 完整构建，不能混用旧版。5 秒行为与长期验证安排保持不变。
+
+0.5.1 修复首次请求等待直接得到终态时的连接器取回确认；取回仍不代表 Agent 已执行后续动作。

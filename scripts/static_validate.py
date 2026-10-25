@@ -214,7 +214,7 @@ def validate_python_sources() -> None:
         ):
             operations.add(comparator.value)
     require(
-        operations == {"health", "submit", "status", "wait", "cancel", "terminate", "recover", "preflight", "read_output"},
+        operations == {"health", "submit", "status", "wait", "cancel", "terminate", "recover", "preflight", "read_output", "acknowledge_receipt"},
         f"broker transport operation set drifted: {sorted(operations)}",
     )
     require("approve" not in operations, "transport must never expose approve")
@@ -487,7 +487,7 @@ def validate_python_sources() -> None:
     )
 
     protocol_source = load_utf8(PLUGIN_ROOT / "scripts" / "relay_protocol.py")
-    require("PROTOCOL_VERSION = 8" in protocol_source, "relay protocol version must be 8")
+    require("PROTOCOL_VERSION = 9" in protocol_source, "relay protocol version must be 9")
     require(
         'PACKAGE_VERSION = VERSION' in protocol_source,
         "package version drifted",
@@ -592,7 +592,7 @@ def validate_python_sources() -> None:
         "权限横幅已移除",
         "claim_token",
         "认领指纹",
-        "协议版本 8",
+        "协议版本 9",
         "Job Object",
         "直接命名",
         "右上角“接入检查”",

@@ -1480,6 +1480,8 @@ class AppearanceTests(unittest.TestCase):
 
     def test_install_diagnostics_are_sanitized_and_detect_exact_cache(self) -> None:
         class FakeServer:
+            store = RequestStore(elevated=False)
+
             @staticmethod
             def connector_snapshot() -> dict[str, object]:
                 return {
@@ -1988,7 +1990,7 @@ class MCPShapeTests(unittest.TestCase):
         self.assertEqual(response["result"]["protocolVersion"], "2025-06-18")
         self.assertEqual(response["result"]["capabilities"], {"tools": {"listChanged": False}})
         self.assertEqual(response["result"]["serverInfo"]["version"], PACKAGE_VERSION)
-        self.assertEqual(PROTOCOL_VERSION, 8)
+        self.assertEqual(PROTOCOL_VERSION, 9)
 
 
 class ReleasePackagingTests(unittest.TestCase):

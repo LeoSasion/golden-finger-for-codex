@@ -969,10 +969,7 @@ def _request_and_wait(
     if scope_recovery is not None:
         result["scope_recovery"] = scope_recovery
     if snapshot.get("state") in TERMINAL_STATES:
-        try:
-            journal.record(payload_hash, phase="terminal")
-        except RelayError:
-            result["recovery_journal_warning"] = "Terminal result returned, but the local receipt update failed."
+        _observe_receipt(result, snapshot, claim_token, codex_thread_id, journal=journal)
     return result
 
 
@@ -1017,6 +1014,19 @@ def _continuation_for(snapshot: dict[str, Any], claim_token: str, wait_seconds: 
 
 
 def _observe_receipt(result, snapshot, claim, codex_thread_id, *, recovery=None, journal=None):
+    if (snapshot.get("state") in TERMINAL_STATES
+            and (snapshot.get("delivery") or {}).get("status") == "awaiting_connector"):
+        try:
+            acknowledged = RelayClient().call(
+                "acknowledge_receipt", request_id=snapshot["request_id"], claim_token=claim,
+                request_hash=snapshot["request_hash"], observed_state=snapshot["state"],
+                client_instance_id=CLIENT_INSTANCE_ID, codex_thread_id=codex_thread_id)
+            delivery = acknowledged.get("request", {}).get("delivery")
+            if not isinstance(delivery, dict) or delivery.get("status") != "connector_received":
+                raise RelayError("invalid_response", "Missing connector receipt.")
+            snapshot["delivery"] = delivery
+        except RelayError:
+            result["delivery_warning"] = "The result is valid; the connector receipt could not be recorded. Do not resubmit."
     try:
         journal = journal or recovery_journal(codex_thread_id, CLIENT_INSTANCE_ID)
         journal.observe(snapshot.get("request_id", ""), claim,

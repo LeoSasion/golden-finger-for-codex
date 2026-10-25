@@ -96,7 +96,7 @@ Skill 按完整问题的语义选择工具，源卡片不必包含 boolean 参�
 
 每个请求都会冻结并哈希有效期限和执行上限。活动响应给出下一次精确参数、等待统计和剩余时间。只有单调有效期限到达时，待确认请求才进入 `expired`；命令运行后使用独立执行超时。短轮询保持原请求及 claim，不自动重提交动作。
 
-语义问询与结构化答案使用本地协议版本 8。端点读取和每次认证请求都会同时比对包版本与运行时 build ID；只要窗口、MCP 连接器或缓存来自不同构建就失败关闭。发布安装时窗口运行时和 Codex 客户端插件必须配套升级。
+语义问询与结构化答案使用本地协议版本 9。端点读取和每次认证请求都会同时比对包版本与运行时 build ID；只要窗口、MCP 连接器或缓存来自不同构建就失败关闭。发布安装时窗口运行时和 Codex 客户端插件必须配套升级。
 
 ## 开发态启动
 
@@ -123,7 +123,7 @@ python -m venv .venv
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\build_windows_release.py
-.\.venv\Scripts\python.exe scripts\verify_windows_release.py dist\golden-finger-0.4.0
+.\.venv\Scripts\python.exe scripts\verify_windows_release.py dist\golden-finger-0.5.1
 ```
 
 Git 保存源码、测试、Skill、构建脚本和开发文档；`build/`、`dist/`、虚拟环境、UI 偏好和本机诊断截图不入库，发行包可在新电脑重新生成。不要迁移旧电脑的端点密钥、请求令牌或正在等待的请求。
@@ -136,7 +136,7 @@ Codex 插件安装/启用及桌面快捷方式需要在新电脑单独配置，�
 
     python -m pip install -r requirements-build.txt
     python scripts\build_windows_release.py
-    python scripts\verify_windows_release.py dist\golden-finger-0.4.0
+    python scripts\verify_windows_release.py dist\golden-finger-0.5.1
 
 发行包还包含 `GoldenFingerSetup.exe` 本地安装管理工具。验证器逐文件复算清单、检查头图相对引用完整性，检查共享 onedir runtime 目录，实际启动 MCP EXE 完成 `initialize`，并让窗口 EXE 用 `--self-test-output` 在不打开 GUI 的情况下验证版本、build ID、自包含模式和 Windows Job Object。运行、复制或安装时必须保留完整发行包，不能只取两个 EXE。GitHub Actions 的 Windows runner 会从干净检出重复单元测试、静态校验、构建和验证；本地成功不替代真实干净 Windows 机器的首次启动与交互验收。
 

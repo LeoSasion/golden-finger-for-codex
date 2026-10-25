@@ -24,8 +24,8 @@ def require(condition, description):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--package", type=Path, default=Path("dist/golden-finger-0.4.0"))
-    parser.add_argument("--output", type=Path, default=Path("build/exe-integration-040-result.json"))
+    parser.add_argument("--package", type=Path, default=Path("dist/golden-finger-0.5.1"))
+    parser.add_argument("--output", type=Path, default=Path("build/exe-integration-051-result.json"))
     options = parser.parse_args()
     workspace = Path(__file__).resolve().parents[1]
     build_root = (workspace / "build").resolve()
@@ -328,9 +328,34 @@ def main():
             require(final_decision["request"]["state"] == terminal, "Decision state changed in MCP transport")
             require(final_decision["request"]["result"].get("answer") == expected_answer, "Decision answer lost meaning or option order")
             require(final_decision["polling"]["terminal"] is True, "Decision answer was not treated as terminal")
+            require(final_decision["request"].get("delivery", {}).get("status") == "connector_received", "EXE did not acknowledge its exact terminal result")
+            require(store.status(request_id, pending_decision["claim_token"])["delivery"]["status"] == "connector_received", "Broker lacks the connector receipt")
             require(store.detail_for_gui(request_id).get("process") is None, "Question unexpectedly spawned a process")
             report["synthetic_question_answers"] += 1
         report["checks"].append("semantic_boolean_false_first_option_reject_stop_roundtrip")
+        report["checks"].append("authenticated_connector_receipt_for_exact_terminal_result")
+        first_wait_args = {**decision_base, "decision_type": "boolean", "wait_seconds": 30,
+                           "idempotency_key": "release-initial-wait-receipt"}
+        send({"jsonrpc": "2.0", "id": 40, "method": "tools/call",
+              "params": {"name": "request_decision", "arguments": first_wait_args}})
+        deadline = time.monotonic() + 10
+        initial_record = None
+        while time.monotonic() < deadline:
+            with store._condition:
+                initial_record = next((item for item in store._records.values()
+                                       if item.frozen["idempotency_key"] == "release-initial-wait-receipt"
+                                       and item.pending_polls_used >= 1), None)
+            if initial_record is not None:
+                break
+            time.sleep(.01)
+        require(initial_record is not None, "Initial request did not enter its first wait")
+        store.reject_from_gui(initial_record.request_id)
+        first_wait_result = structured(receive(40))
+        require(first_wait_result["request"]["state"] == "answered", "Initial wait lost terminal answer")
+        require(first_wait_result["request"]["result"]["answer"]["value"] is False, "Initial wait lost negative answer")
+        require(first_wait_result["request"].get("delivery", {}).get("status") == "connector_received", "Initial wait omitted receipt acknowledgement")
+        report["synthetic_question_answers"] += 1
+        report["checks"].append("initial_request_wait_acknowledges_terminal_answer")
         require(all(record.process is None for record in store._records.values()), "Fixture spawned an unexpected process")
         written_files = {path.relative_to(temporary_path).as_posix() for path in temporary_path.rglob("*") if path.is_file()}
         require("GoldenFinger/endpoint.json" in written_files, "Fixture endpoint is missing")

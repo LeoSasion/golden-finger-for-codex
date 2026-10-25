@@ -27,7 +27,7 @@ from typing import Any
 from release_metadata import VERSION, source_build_id
 
 
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 9
 PACKAGE_VERSION = VERSION
 PACKAGE_BUILD_ID = "source"
 PRODUCT_NAME = "GoldenFinger"

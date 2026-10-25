@@ -199,7 +199,8 @@ class DecisionWindowTests(unittest.TestCase):
                 window.refresh()
                 request_id = snapshot["request_id"]
                 self.assertEqual(window.current_request_id, request_id)
-                self.assertIn("同意 =", window._summary_values[2])
+                self.assertIn("同意后", window._summary_values[1])
+                self.assertIn("是否不再提示", window._summary_values[2])
                 text = window.detail.get("1.0", "end")
                 self.assertIn("是否不再提示？", text)
                 self.assertIn("原始问题", text)
@@ -248,6 +249,9 @@ class DecisionMCPTests(unittest.TestCase):
                     return {"ok": True, "request": owner.store.status(kwargs["request_id"], kwargs["claim_token"])}
                 if operation == "recover":
                     return owner.store.recover(kwargs["recovery_token"], kwargs["payload_hash"])
+                if operation == "acknowledge_receipt":
+                    return {"ok": True, "request": owner.store.acknowledge_receipt(
+                        kwargs["request_id"], kwargs["claim_token"], kwargs["request_hash"], kwargs["observed_state"])}
                 raise AssertionError(operation)
         def journal(thread, process):
             return recovery.RecoveryJournal("process:" + process, root=self.root)
@@ -255,6 +259,48 @@ class DecisionMCPTests(unittest.TestCase):
             mocked = patch.object(mcp, name, replacement)
             mocked.start()
             self.addCleanup(mocked.stop)
+
+    def test_first_request_wait_records_receipt_for_boolean_selection_and_consent(self):
+        owner = self
+        original_client = mcp.RelayClient
+        class CompletingClient(original_client):
+            def call(self, operation, **kwargs):
+                if operation == "wait":
+                    record = owner.store._records[kwargs["request_id"]]
+                    if record.kind == "decision" and record.frozen["decision_type"] == "boolean":
+                        owner.store.reject_from_gui(record.request_id)
+                    else:
+                        owner.store.approve_from_gui(record.request_id)
+                return super().call(operation, **kwargs)
+        for index, kind in enumerate(("boolean", "single_select", "consent")):
+            data = question("single_select" if kind == "single_select" else "boolean", key=f"initial-wait-receipt-{index}")
+            tool = "request_decision"
+            if kind == "consent":
+                tool = "request_consent"
+                for field in ("decision_type", "true_label", "false_label", "question_id"):
+                    data.pop(field, None)
+                data["approved_reply"] = "Only this text reply"
+            with self.subTest(kind=kind), patch.object(mcp, "RelayClient", CompletingClient):
+                result = mcp.call_tool(tool, {**data, "wait_seconds": 30})
+            self.assertTrue(result["polling"]["terminal"])
+            self.assertEqual(result["request"]["delivery"]["status"], "connector_received")
+            self.assertEqual(self.store.status(result["request"]["request_id"], result["claim_token"])["delivery"]["status"], "connector_received")
+            if kind == "boolean":
+                self.assertIs(result["request"]["result"]["answer"]["value"], False)
+
+    def test_terminal_submission_acknowledges_without_a_separate_wait(self):
+        owner = self
+        original_client = mcp.RelayClient
+        class FastDecisionClient(original_client):
+            def call(self, operation, **kwargs):
+                response = super().call(operation, **kwargs)
+                if operation == "submit":
+                    response["request"] = owner.store.approve_from_gui(response["request"]["request_id"])
+                return response
+        with patch.object(mcp, "RelayClient", FastDecisionClient):
+            result = mcp.call_tool("request_decision", {**question(key="terminal-submission-receipt"), "wait_seconds": 30})
+        self.assertEqual(result["request"]["delivery"]["status"], "connector_received")
+        self.assertNotIn("wait", self.operations)
 
     def test_mcp_negative_answer_is_terminal_and_recovered_without_resubmission(self):
         args = {**question(), "wait_seconds": 0}

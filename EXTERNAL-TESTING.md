@@ -133,7 +133,7 @@ In a fresh Windows checkout or disposable VM, with Python available only for the
 
     python -m pip install -r requirements-build.txt
     python scripts\build_windows_release.py
-    python scripts\verify_windows_release.py dist\golden-finger-0.4.0
+    python scripts\verify_windows_release.py dist\golden-finger-0.5.1
 
 The verifier must recalculate every manifest hash, require the shared PyInstaller onedir layout and sibling `bin\golden-finger.runtime` directory, initialize `bin\golden-finger-mcp.exe`, and run `bin\GoldenFinger.exe --self-test-output ...` without opening the GUI. Broker and MCP must report the version from `release_metadata.VERSION` and the identical stamped `rel-…` build ID in self-contained mode; the Broker probe must successfully create a Windows Job Object. The package must also contain `bin\GoldenFingerSetup.exe`, complete original README assets, and installation instructions. Tests on Python 3.13 and 3.14 precede one canonical Python 3.13 build; tag publishing uses that same verified artifact.
 
@@ -155,7 +155,7 @@ The GitHub Actions `Windows release verification` workflow must pass from a clea
 After building, these checks use temporary installation roots, an isolated loopback Broker and current-user protected receipts. They never install into the user's existing root, modify Codex settings, authorize a real user action or execute a business command. The MCP check starts the real packaged connector twice to verify recovery across process restart and answers only synthetic, side-effect-free questions in its own isolated store.
 
 ```powershell
-$env:GOLDEN_FINGER_RELEASE_PACKAGE = (Resolve-Path dist/golden-finger-0.4.0).Path
+$env:GOLDEN_FINGER_RELEASE_PACKAGE = (Resolve-Path dist/golden-finger-0.5.1).Path
 python -m unittest discover -s tests -p test_release_enhancements.py -v
 python tests/verify_mcp_release.py --package "$env:GOLDEN_FINGER_RELEASE_PACKAGE"
 Remove-Item Env:GOLDEN_FINGER_RELEASE_PACKAGE

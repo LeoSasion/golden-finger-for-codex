@@ -11,7 +11,7 @@ import re
 import subprocess
 import sys
 
-VERSION = "0.4.0"
+VERSION = "0.5.1"
 MANIFEST_SCHEMA_VERSION = 2
 
 

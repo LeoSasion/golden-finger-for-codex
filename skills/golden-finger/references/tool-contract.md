@@ -82,6 +82,8 @@ Explicitly terminates only the command identified by its matching `request_id` a
 
 ## State machine
 
+On a terminal result, the connector privately acknowledges receipt with the original claim, exact request hash and observed state. The Broker records `delivery.status=connector_received` and a monotonic latency in memory. This operation cannot approve, execute, change an answer or revoke a decision. An unavailable acknowledgement adds `delivery_warning` while preserving the valid terminal result; never resubmit because of that warning. Receipt proves only that the connector retrieved the result, not that the host Agent saw it or performed a later action. Recent receipt evidence never authenticates the currently open chat.
+
 \`pending -> approved | rejected | cancelled | expired\`
 
 For command requests:

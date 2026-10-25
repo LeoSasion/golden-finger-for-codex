@@ -35,6 +35,8 @@ def connection_steps(snapshot: dict[str, Any]) -> list[tuple[str, str, str]]:
     installed = bool(snapshot.get("cached_installs"))
     connector = snapshot.get("last_connector")
     matched = snapshot.get("component_match") is True
+    delivery = snapshot.get("recent_delivery")
+    received = isinstance(delivery, dict) and bool(delivery.get("received_at"))
     return [
         ("窗口", "已运行", "此报告来自正在运行的窗口。"),
         ("MCP", "最近握手匹配" if matched else "构建不匹配" if connector else "尚未观察到连接",
@@ -43,7 +45,9 @@ def connection_steps(snapshot: dict[str, Any]) -> list[tuple[str, str, str]]:
         ("插件", "已检测到启用配置" if enabled is True else "已检测到禁用配置" if enabled is False else "启用状态尚未确认",
          "找到缓存安装；配置状态仍应以 Codex 插件设置为准。" if installed else
          "未发现缓存安装；直接启动 EXE 不代表插件已经安装。请从 Codex 支持的插件入口接入完整发行目录。"),
-        ("当前聊天", "需在目标聊天验证", "在目标聊天调用 relay_health，再提交一条仅返回文字的测试请求并检查回执。任务线索或旧连接记录不能证明本次聊天已接入。"),
+        ("当前聊天", "最近实测已取回" if received else "需在目标聊天验证",
+         "最近一次文字问询的结果已被连接器取回；这不认证当前聊天，也不代表 Agent 已执行后续动作。切换聊天后请重新进行文字测试。" if received else
+         "下一步：复制聊天测试提示词，在要使用的聊天中检查 relay_health 并完成一次文字问询。任务线索或旧连接记录不能证明本次聊天已接入。"),
     ]
 
 

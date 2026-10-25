@@ -59,6 +59,8 @@ from codex_lifecycle import (
 )
 from relay_execution import BoundedOutput, WindowsJob, decode_output, start_contained_process
 from relay_decisions import decision_result, decision_summary, decision_detail
+from relay_experience import CHAT_TEST_PROMPT, PracticeSession, delivery_copy, question_presentation, repair_prompt
+from relay_experience_ui import ExperienceUI
 from relay_protocol import (
     preflight_command,
     DEFAULT_PENDING_POLL_CYCLES,
@@ -70,6 +72,7 @@ from relay_protocol import (
     PROTOCOL_VERSION,
     REQUEST_ID_PREFIX,
     RUNTIME_BUILD_ID,
+    TERMINAL_STATES,
     RelayError,
     broker_is_reachable,
     canonical_hash,
@@ -119,16 +122,6 @@ UI_SETTINGS_FILENAME = "ui-settings.json"
 DEFAULT_AUTO_APPROVE_WAIT_SECONDS = 5
 MAX_AUTO_APPROVE_WAIT_SECONDS = 3_600
 ACTIVE_STATES = {"pending", "running"}
-TERMINAL_STATES = {
-    "approved",
-    "rejected",
-    "cancelled",
-    "expired",
-    "completed",
-    "failed",
-    "timed_out",
-    "terminated",
-}
 
 
 @dataclass(frozen=True)
@@ -1736,6 +1729,8 @@ class RequestRecord:
     terminal_monotonic: float | None = None
     receipt: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
+    delivery: dict[str, Any] | None = None
+    delivery_monotonic: float | None = field(default=None, repr=False)
     pending_polls_used: int = 0
     process: subprocess.Popen[bytes] | None = field(default=None, repr=False)
     process_job: WindowsJob | None = field(default=None, repr=False)
@@ -1767,6 +1762,9 @@ class RequestRecord:
             "updated_at": self.updated_at,
             "expires_at": self.expires_at,
             "broker_elevated": self.elevated,
+            "delivery": dict(self.delivery) if self.delivery else {
+                "status": "awaiting_connector" if self.state in TERMINAL_STATES else "awaiting_result"
+            },
             "poll_policy": {
                 **self.frozen["poll_policy"],
                 "pending_polls_used": self.pending_polls_used,
@@ -2814,6 +2812,39 @@ class RequestStore:
                 "frozen": json.loads(json.dumps(record.frozen)),
             }
 
+    def acknowledge_receipt(self, request_id: Any, claim_token: Any,
+                            request_hash: Any, observed_state: Any) -> dict[str, Any]:
+        """Receipt of one exact terminal snapshot, never an approval operation."""
+        with self._condition:
+            record = self._get_claimed_locked(request_id, claim_token)
+            if (record.state not in TERMINAL_STATES or observed_state != record.state
+                    or request_hash != record.request_hash):
+                raise RelayError("receipt_mismatch", "Only the exact terminal result can be acknowledged.")
+            if record.delivery is None:
+                now = iso_timestamp()
+                record.delivery = {"status": "connector_received", "received_at": now,
+                                   "state": record.state, "request_hash": record.request_hash}
+                record.delivery_monotonic = time.monotonic()
+                if record.terminal_monotonic is not None:
+                    record.delivery["receipt_latency_ms"] = round(
+                        max(0, record.delivery_monotonic - record.terminal_monotonic) * 1000, 1)
+                record.updated_at = now
+                self._mark_gui_changed_locked()
+            return record.public_snapshot()
+
+    def recent_delivery(self) -> dict[str, Any] | None:
+        with self._condition:
+            self._expire_locked()
+            record = max((item for item in self._records.values()
+                          if item.delivery and item.kind in {"consent", "decision"}),
+                         key=lambda item: item.delivery_monotonic or 0, default=None)
+            if record is None:
+                return None
+            return {"received_at": record.delivery["received_at"],
+                    "source_task": record.frozen["source_task"],
+                    "source_project": record.frozen["source_project"],
+                    "connector_fingerprint": record.frozen["connector_fingerprint"]}
+
     def active_counts(self) -> tuple[int, int]:
         _revision, _rows, pending, running = self.gui_snapshot()
         return pending, running
@@ -2982,6 +3013,10 @@ class RelayRequestHandler(socketserver.StreamRequestHandler):
                         request.get("claim_token"),
                     ),
                 }
+            elif operation == "acknowledge_receipt":
+                response = {"ok": True, "request": server.store.acknowledge_receipt(
+                    request.get("request_id"), request.get("claim_token"),
+                    request.get("request_hash"), request.get("observed_state"))}
             elif operation == "wait":
                 wait_seconds = request.get("wait_seconds", 0)
                 blocking = (
@@ -3238,6 +3273,7 @@ def collect_install_diagnostics(
             job_error = exc.code
     return {
         "product": "Codex金手指",
+        "recent_delivery": server.store.recent_delivery() if server is not None else None,
         "protocol": PROTOCOL_VERSION,
         "broker_version": BROKER_VERSION,
         "broker_build_id": BROKER_BUILD_ID,
@@ -3367,7 +3403,7 @@ class RelayTCPServer(socketserver.ThreadingTCPServer):
             return tuple(reversed(self._connector_thread_ids))
 
 
-class RelayWindow:
+class RelayWindow(ExperienceUI):
     def __init__(
         self,
         root: tk.Tk,
@@ -3461,6 +3497,7 @@ class RelayWindow:
             pass
 
         self._build_ui()
+        self._build_experience_controls()
         self.auto_approve_wait_value.trace_add("write", self._on_auto_approve_edited)
         root.bind("<Configure>", self._schedule_responsive_layout, add="+")
         root.bind("<Escape>", self._on_escape, add="+")
@@ -3873,7 +3910,7 @@ class RelayWindow:
             self.decision_stage,
             text="停止",
             command=self.stop_selected,
-            on_interaction=self._reset_auto_approve_timers,
+            on_interaction=self._note_decision_interaction,
             variant="neutral",
             diameter=52,
         )
@@ -3882,7 +3919,7 @@ class RelayWindow:
             self.decision_stage,
             text="同意\n本次",
             command=self.approve_selected,
-            on_interaction=self._reset_auto_approve_timers,
+            on_interaction=self._note_decision_interaction,
             variant="primary",
             diameter=170,
         )
@@ -3891,7 +3928,7 @@ class RelayWindow:
             self.decision_stage,
             text="拒绝",
             command=self.reject_selected,
-            on_interaction=self._reset_auto_approve_timers,
+            on_interaction=self._note_decision_interaction,
             variant="danger",
             diameter=52,
         )
@@ -4008,7 +4045,7 @@ class RelayWindow:
         width = max(WINDOW_SNAP_MIN_WIDTH, self.root.winfo_width())
         self.auto_approve_status.configure(wraplength=max(200, width - 32))
         layout = responsive_window_layout(width)
-        signature = (width, *layout.values())
+        signature = (width, self._compact_mode, *layout.values())
         if not force and signature == self._responsive_layout_signature:
             return
 
@@ -4068,6 +4105,7 @@ class RelayWindow:
         # keeps previews accurate at intermediate sizes and with native fonts.
         self.root.update_idletasks()
         content_width = max(220, width - 32)
+        self._apply_experience_layout()
         left_wrap = max(190, self.task_panel.winfo_width() - 32)
         decision_wrap = max(190, self.decision_panel.winfo_width() - 32)
         self.header_subtitle.configure(wraplength=content_width)
@@ -5058,7 +5096,8 @@ class RelayWindow:
         )
         self._set_decision_summary(source_text, action_text)
         self.decision_state_label.configure(text=state_text)
-        self.detail_toggle_button.configure(state=tk.DISABLED, text="详细参数 ›")
+        self.detail_toggle_button.configure(state=tk.NORMAL, text="开始接入检查",
+                                            command=self.show_connection_guide)
         self.approve_button.set_state(tk.DISABLED)
         self.stop_button.set_state(tk.DISABLED)
         self.reject_button.set_state(tk.DISABLED)
@@ -5313,7 +5352,7 @@ class RelayWindow:
         )
         if newest_request is not None and (
             not self.current_request_id
-            or (self._window_preferences.get("select_new_request", True) and not self._detail_expanded)
+            or (self._window_preferences.get("select_new_request", True) and not self._selection_is_protected())
         ):
             request_id = str(newest_request["request_id"])
             if self._task_filter != "active":
@@ -5342,6 +5381,7 @@ class RelayWindow:
         if newest_request is not None:
             self._notify_new_request()
         self._set_pending_attention(pending_count > 0)
+        self._refresh_experience(pending_count)
         self._update_inventory_and_restart(
             inventory,
             pending_count=pending_count,
@@ -5349,7 +5389,7 @@ class RelayWindow:
         )
         status_text = (
             f"待确认 {pending_count} · 执行中 {running_count} · "
-            f"本地端口 {self.server.server_address[1]}"
+            "当前窗口显示本次结果的取回状态"
         )
         if status_text != self._status_text:
             self.status_label.configure(text=status_text)
@@ -5408,6 +5448,7 @@ class RelayWindow:
             detail["state"],
             detail.get("execution_phase"),
             detail.get("output_revision"),
+            (detail.get("delivery") or {}).get("status"),
             detail["updated_at"],
             poll_policy["pending_polls_used"],
             remaining_seconds,
@@ -5416,6 +5457,8 @@ class RelayWindow:
         if render_signature == self._content_render_signature:
             return
         self._set_decision_mode("request")
+        heading, outcome, alternative = question_presentation(frozen)
+        self.decision_heading_label.configure(text=heading)
         source_project = self._one_line(
             frozen.get("source_project"), fallback="未标注项目", limit=46
         )
@@ -5424,11 +5467,14 @@ class RelayWindow:
         )
         self._set_decision_summary(
             f"{source_project} · {source_task}",
-            self._one_line(frozen.get("exact_action"), fallback="授权请求", limit=140),
-            (decision_summary(frozen) if frozen.get("kind") == "decision" else
+            (outcome if frozen.get("kind") == "decision" else
+             self._one_line(frozen.get("exact_action"), fallback="授权请求", limit=140)),
+            ("问题 · " + str(frozen["exact_action"]) if frozen.get("kind") == "decision" else
              "目标 · " + self._one_line(frozen.get("target"), fallback="未标注", limit=120)),
-            "风险 · " + self._one_line(frozen.get("risk"), fallback="未标注", limit=110),
+            (alternative if frozen.get("kind") == "decision" else
+             "风险 · " + self._one_line(frozen.get("risk"), fallback="未标注", limit=110)),
         )
+        self.guard_label.configure(text=delivery_copy(detail) if detail["state"] in TERMINAL_STATES else alternative)
         parameter_count = 6
         if frozen.get("kind") == "command":
             arguments = frozen.get("arguments")
@@ -5439,6 +5485,7 @@ class RelayWindow:
         preview_hint = " · 含省略" if self._summary_has_ellipsis else ""
         self.detail_toggle_button.configure(
             state=tk.NORMAL,
+            command=self.toggle_detail,
             text=f"详细参数 {parameter_count}项{preview_hint} {marker}",
         )
         reset_scroll = request_id != self._detail_request_id
@@ -5740,6 +5787,10 @@ class RelayWindow:
 
     def show_tools_menu(self) -> None:
         menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="接入引导", command=self.show_connection_guide, accelerator="F1")
+        menu.add_command(label="体验演示（无副作用）", command=self.show_practice, accelerator="F3")
+        menu.add_command(label="紧凑模式 / 完整视图", command=self.toggle_compact_mode, accelerator="F2")
+        menu.add_checkbutton(label="新请求提示音", variable=self.sound_enabled, command=self._on_sound_toggle)
         menu.add_command(label="通知与选择偏好", command=self.show_notification_preferences)
         menu.add_command(label="收起到系统托盘", command=self.hide_to_tray)
         menu.add_command(label="导出脱敏操作摘要", command=self.export_audit_summary)
@@ -5763,7 +5814,7 @@ class RelayWindow:
         for key, label in (
             ("raise_on_request", "新请求到来时唤起窗口"),
             ("topmost_pending", "有待确认请求时保持置顶"),
-            ("select_new_request", "自动选中新请求（查看详情时保留当前项）"),
+            ("select_new_request", "自动选中新请求（查看详情或操作当前项时保留选择）"),
         ):
             variable = tk.BooleanVar(window, value=self._window_preferences[key])
             variables[key] = variable
@@ -5772,7 +5823,7 @@ class RelayWindow:
         ttk.Label(panel, text="这些设置只改变提醒方式，不改变审批或执行规则。",
                   style="Meta.HAR.TLabel").pack(anchor=tk.W, pady=8)
         def save() -> None:
-            values = {key: variable.get() for key, variable in variables.items()}
+            values = {**self._window_preferences, **{key: variable.get() for key, variable in variables.items()}}
             try:
                 save_preferences(self._window_preferences_path, values)
             except OSError:
